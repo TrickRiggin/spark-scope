@@ -1,0 +1,15 @@
+{
+  "name": "spark-scope",
+  "version": "0.1.0",
+  "description": "Read-only monitoring dashboard for one to four (or more) NVIDIA DGX Spark-class nodes and their inference server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "license": "MIT"
+}

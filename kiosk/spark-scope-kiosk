@@ -1,0 +1,26 @@
+#!/bin/sh
+# Shows the Spark Scope rack panel full screen in Chromium, for a bar display on a Raspberry Pi
+# (Raspberry Pi OS with labwc/Wayland) or any other Linux desktop. Install as ~/.local/bin/spark-scope-kiosk.
+#
+# SPARK_SCOPE_RACK_URL  the panel to show (default: a dashboard on this machine). For a dashboard on
+#                       another machine use e.g. http://dashboard-host:8787/rack/ ; for a display that
+#                       is not 4:1, add ?width=N (see README).
+# CHROMIUM              the browser binary (default: chromium, then chromium-browser).
+URL="${SPARK_SCOPE_RACK_URL:-http://127.0.0.1:8787/rack/}"
+BASE="${URL%%/rack*}"
+CHROMIUM="${CHROMIUM:-$(command -v chromium || command -v chromium-browser)}"
+if [ -z "$CHROMIUM" ]; then
+  echo "spark-scope-kiosk: Chromium not found; set CHROMIUM=/path/to/chromium" >&2
+  exit 1
+fi
+# Wait until the dashboard answers (any HTTP status) so Chromium never opens on an error page.
+until curl -s -o /dev/null --max-time 3 "$BASE/api/health"; do
+  sleep 5
+done
+exec "$CHROMIUM" --ozone-platform-hint=auto \
+  --kiosk --noerrdialogs --disable-infobars --no-first-run \
+  --disable-session-crashed-bubble --hide-crash-restore-bubble \
+  --disable-features=Translate --password-store=basic \
+  --check-for-update-interval=31536000 --overscroll-history-navigation=0 \
+  --user-data-dir="$HOME/.local/share/spark-scope-kiosk" \
+  "$URL"
