@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { normalizeTopology, serverTopology, topologyServers } from "../lib/topology.mjs";
-import { combineServerStatus } from "../lib/cluster.mjs";
+import { combineServerStatus, unlistedServingNodes } from "../lib/cluster.mjs";
 import { fabricLayout } from "../public/view-data.js";
 
 const nodes = ["w", "m", "c", "p"].map((id) => ({ id, host: id }));
@@ -43,4 +43,14 @@ test("a node without a cable stands beside the ring in the diagram", () => {
   const at = Object.fromEntries(layout.nodes.map((node) => [node.id, node]));
   assert.equal(at.p.x, 340);
   for (const id of ["w", "m", "c"]) assert.ok(at[id].x < 300);
+});
+
+test("a box serving a model the layout does not expect is reported", () => {
+  const topology = normalizeTopology({ nodes: nodes.map((n) => (n.id === "c" ? { ...n, inference: false } : n)), servers: [
+    { id: "glm", api: "http://127.0.0.1:8888", nodes: ["w", "m", "c"] }] });
+  const up = { ok: true, inferenceProcessUp: true }, idle = { ok: true, inferenceProcessUp: false };
+  assert.deepEqual(unlistedServingNodes({ w: up, m: up, c: up, p: up }, topology).map((n) => n.id), ["c", "p"]);
+  assert.deepEqual(unlistedServingNodes({ w: up, m: up, c: idle, p: idle }, topology), []);
+  // Without servers in topology.json the upstream meaning holds: "inference": false only allows a box to idle.
+  assert.deepEqual(unlistedServingNodes({ c: up }, normalizeTopology({ nodes: [{ id: "c", host: "c", inference: false }] })), []);
 });

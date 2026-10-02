@@ -35,7 +35,7 @@ The screenshots use synthetic data from `tools/fixtures.mjs`.
 
 This fork runs the Grove's dashboard on Sequoia. It adds:
 
-- **Several model servers.** `topology.json` can list `"servers"`, each with an `api` URL and the nodes it runs on. The page shows a strip with every server's model, output rate and queue; the one you pick drives the output chart, engine panel and token ledger (one ledger file per server, `usage-<id>.sqlite`). A box whose server has no model loaded reads as idle, not as a fault, while another server serves. Without `"servers"` it behaves as upstream.
+- **Several model servers.** `topology.json` can list `"servers"`, each with an `api` URL and the nodes it runs on. The page shows a strip with every server's model, output rate and queue; the one you pick drives the output chart, engine panel and token ledger (one ledger file per server, `usage-<id>.sqlite`). A box whose server has no model loaded reads as idle, not as a fault, while another server serves. A box running a model that no server lists (or that is marked `"inference": false`) turns the status amber, so a stale layout shows. Without `"servers"` it behaves as upstream.
 
   ```json
   "servers": [

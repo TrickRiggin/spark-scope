@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { collectNode, uncollectedNode, InferenceCollector, applyNetworkRates } from "./lib/collectors.mjs";
-import { buildRingLinks, clusterStatus, combineServerStatus, servingSummary, DEFAULT_LINK_MIN_GBPS } from "./lib/cluster.mjs";
+import { buildRingLinks, clusterStatus, combineServerStatus, servingSummary, unlistedServingNodes, DEFAULT_LINK_MIN_GBPS } from "./lib/cluster.mjs";
 import { downsampleHistory, summarizeHistory } from "./lib/history.mjs";
 import { hostAllowed, hostRules, SECURITY_HEADERS } from "./lib/http-guard.mjs";
 import { publicState } from "./lib/public-state.mjs";
@@ -138,6 +138,11 @@ function refreshClusterStatus() {
   const sharedDown = shared.find((link) => !["pending", "unknown"].includes(state.ringLinks[link.id]?.state)
     && !(state.ringLinks[link.id]?.state === "up" && !state.ringLinks[link.id]?.slow));
   if (sharedDown && state.status === "healthy") Object.assign(state, { status: "degraded", message: "QSFP link needs attention" });
+  const unlisted = unlistedServingNodes(state.nodes, topology);
+  if (unlisted.length && state.status === "healthy") {
+    const names = unlisted.map((meta) => meta.name).join(", ");
+    Object.assign(state, { status: "degraded", message: `${names} ${unlisted.length === 1 ? "runs" : "run"} a model the layout does not list; update topology.json` });
+  }
   state.updatedAt = new Date().toISOString();
 }
 
