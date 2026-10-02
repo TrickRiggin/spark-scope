@@ -2,6 +2,11 @@ import {
   orderedNodes, nodeLinks, nodeView, reasonText, clusterView, seriesPoints, timePaths, valueRange, tempRangeLabel, f1, compact, freeLabel, panelWidth, bayLayout,
 } from "./rack-view.js";
 
+// /rack/?server=<id> picks the model server the band follows; without it, the first one.
+const serverParam = (() => { const id = new URLSearchParams(location.search).get("server"); return id ? `&server=${encodeURIComponent(id)}` : ""; })();
+// With several model servers, only the picked server's nodes are expected to run its inference process.
+const inServer = (state, id) => !state?.server || Boolean((state.servers ?? []).find((server) => server.id === state.server)?.nodes.includes(id));
+
 const POLL_MS = 2000;
 const TEMP_POLL_MS = 30_000;
 const FETCH_TIMEOUT_MS = 4000;
@@ -79,7 +84,7 @@ const meter = (label, value, pct, warn = false, detail = "") => `<div class="met
 
 function renderBay(meta, toMs) {
   const links = nodeLinks(latest, meta.id);
-  const view = nodeView(meta, latest.nodes?.[meta.id], { inferenceOk: Boolean(latest?.inference?.ok), lastOkAt: lastOkAt[meta.id], nowMs: toMs, links });
+  const view = nodeView(meta, latest.nodes?.[meta.id], { inferenceOk: Boolean(latest?.inference?.ok) && inServer(latest, meta.id), lastOkAt: lastOkAt[meta.id], nowMs: toMs, links });
   const target = view.local ? "local" : view.host ? `SSH ${view.host}` : "no host";
   const el = bays.querySelector(`[data-node="${CSS.escape(meta.id)}"]`);
   el.className = `bay ${view.level}`;
@@ -176,7 +181,7 @@ async function poll() {
   polling = true;
   let state = null;
   try {
-    state = await getJson("/api/state?minutes=15&history=0");
+    state = await getJson(`/api/state?minutes=15&history=0${serverParam}`);
   } catch {
     renderCluster(true);
   }
@@ -204,7 +209,7 @@ async function poll() {
 // Every 30 s: the 60-minute history for the temperature traces and the band's earlier samples.
 async function pollTemps() {
   try {
-    const state = await getJson("/api/state?minutes=60");
+    const state = await getJson(`/api/state?minutes=60${serverParam}`);
     tempHistory = state.history ?? [];
     if (latest) renderBays();
   } catch {

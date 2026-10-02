@@ -7,6 +7,12 @@ let history = [], historyAt = 0, historyRange = null;
 // The token ledger counts days in the server's time zone (usage.timeZone); until the first response, the viewer's own.
 let ledgerTimeZone = null;
 const ledgerToday = () => localDay(Date.now(), ledgerTimeZone);
+// Model servers (topology.json "servers"): the one the output, engine and ledger panels follow, from ?server= or the
+// last pick in this browser. The server answers with its first server for an id it does not know.
+let selectedServer=new URLSearchParams(location.search).get('server');try{selectedServer??=localStorage.getItem('spark-scope-server')}catch{}
+const serverQuery=()=>selectedServer?`&server=${encodeURIComponent(selectedServer)}`:'';
+// Node id -> its server summary, rebuilt from every state.
+let serverOf={};
 // Until the server names its ledger time zone, the month is a guess; it follows the server's month unless picked by hand.
 let selectedMonth = ledgerToday().slice(0,7), earliestMonth = null, monthPicked = false;
 const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
@@ -23,7 +29,7 @@ function applyTheme() {
 themeToggle.addEventListener('click',()=>{themeChoice=nextTheme(themeChoice,darkQuery.matches?'dark':'light');try{themeChoice?localStorage.setItem('spark-scope-theme',themeChoice):localStorage.removeItem('spark-scope-theme')}catch{}applyTheme()});
 onMediaChange(darkQuery,applyTheme);applyTheme();
 
-const ROLE_NAMES={HEAD:'Head',WORKER:'Worker',NODE:'Node'};
+const ROLE_NAMES={HEAD:'Head',WORKER:'Worker',NODE:'Node',SOLO:'Solo'};
 // Badge colours follow the node's state, the same way the rack panel colours its bays.
 const BADGE_LEVELS={serving:'good',idle:'idle','no GPU data':'warn','no response':'crit','not collected':'idle'};
 // One card per node in topology order; rebuilt when anything in topology.json changes on the server.
@@ -42,13 +48,16 @@ function renderNode(meta,node) {
   const el=$('#nodes').querySelector(`[data-node-id="${CSS.escape(meta.id)}"]`);if(!el)return;
   const set=(name,value)=>{const field=el.querySelector(`[data-node="${name}"]`);field.textContent=value;field.classList.toggle('unknown-value',value===UNKNOWN);if(field.parentElement.hasAttribute('data-optional'))field.parentElement.hidden=value===UNKNOWN};
   const pending=meta.collect===false||node?.collected===false,ok=Boolean(node?.ok);el.classList.toggle('is-unknown',!ok);
+  const home=serverOf[meta.id];el.classList.toggle('other-server',Boolean(latest?.server&&home?.id!==latest.server));
   const target=meta.local?'local':meta.host??'no host';
-  set('title',meta.name);set('role',[ROLE_NAMES[meta.role]??meta.role,meta.hardware].filter(Boolean).join(' | '));
+  set('title',meta.name);set('role',[home?.name!==meta.name?home?.name:null,ROLE_NAMES[meta.role]??meta.role,meta.hardware].filter(Boolean).join(' | '));
   const state=pending?'not collected':!ok?'no response':node.gpu?.available===false?'no GPU data':node.inferenceProcessReady?'serving':'idle';
   set('state',state);el.querySelector('.badge').dataset.level=BADGE_LEVELS[state]??'idle';
   set('connection',pending?`${target} | not collected`:ok?`${target} | ${fixed(node.latencyMs,0)} ms`:`${target} | status unknown`);
   const gpu=ok?node.gpu:{};set('gpu',finite(gpu?.utilization)?fixed(gpu.utilization,0)+'%':UNKNOWN);el.querySelector('[data-node="gpu"]').classList.toggle('full',finite(gpu?.utilization)&&gpu.utilization>=99.5);
-  set('temp',fixed(gpu?.temperature,0));set('power',fixed(gpu?.powerWatts));set('memory',gib(ok?node.memory?.availableBytes:null));set('clock',fixed(gpu?.clockMHz,0));
+  set('temp',fixed(gpu?.temperature,0));
+  // The card warms with the GPU: no tint below 55 °C, full red glow from 90 °C.
+  el.style.setProperty('--heat',finite(gpu?.temperature)?String(Math.max(0,Math.min(1,(gpu.temperature-55)/35)).toFixed(2)):'0');el.classList.toggle('hot',finite(gpu?.temperature)&&gpu.temperature>=85);set('power',fixed(gpu?.powerWatts));set('memory',gib(ok?node.memory?.availableBytes:null));set('clock',fixed(gpu?.clockMHz,0));
   const total=ok?node.memory?.totalBytes:null,used=ok?node.memory?.usedBytes:null;
   set('memory-used',finite(total)&&finite(used)?`${gib(used)} / ${gib(total,0)} GiB`:UNKNOWN);
   el.querySelector('.needle').setAttribute('stroke-dasharray',`${finite(gpu?.utilization)?Math.max(0,Math.min(100,gpu.utilization)):0} 100`);
@@ -106,38 +115,57 @@ function renderState(state) {
   latest=state;lastTopology=state.topology??lastTopology;
   if(state.usage?.timeZone&&state.usage.timeZone!==ledgerTimeZone){ledgerTimeZone=state.usage.timeZone;if(!monthPicked&&selectedMonth!==ledgerToday().slice(0,7)){selectedMonth=ledgerToday().slice(0,7);monthLoadedAt=0;rebuildMonths();if(!$('#tokens').hidden)void refreshMonth(true)}}
   syncNodes(nodeOrder(state));$('#shell').classList.remove('stale');
+  serverOf=Object.fromEntries((state.servers??[]).flatMap(server=>server.nodes.map(id=>[id,server])));renderServers(state);
   const v=state.inference,stopped=state.inferenceState==='stopped',nodes=state.nodes||{};
-  const online=metas.filter(m=>nodes[m.id]?.ok).length,serving=metas.filter(m=>nodes[m.id]?.ok&&nodes[m.id]?.inferenceProcessReady).length,count=metas.length;
+  const scope=state.server?metas.filter(m=>serverOf[m.id]?.id===state.server):metas;
+  const online=metas.filter(m=>nodes[m.id]?.ok).length,serving=scope.filter(m=>nodes[m.id]?.ok&&nodes[m.id]?.inferenceProcessReady).length,count=metas.length,processes=metas.filter(m=>nodes[m.id]?.ok&&nodes[m.id]?.inferenceProcessReady).length;
   $('.status').className='status '+(state.status==='healthy'?'':stopped?'stopped':'error');text('#status-title',state.message||'Checking status');
   const watts=metas.map(m=>nodes[m.id]).filter(n=>n?.ok&&finite(n.gpu?.powerWatts)).map(n=>n.gpu.powerWatts);
-  $('#status-desc').innerHTML=`<span>Nodes ${online}/${count}</span><span>Inference processes ${serving}/${count}</span><span>API ${v?.ok?'up':'no response'}</span>${watts.length?`<span>GPU power ${fixed(watts.reduce((sum,w)=>sum+w,0),1)} W${watts.length<count?` (${watts.length}/${count} nodes)`:''}</span>`:''}`;
-  text('#updated-at',clockTime(state.updatedAt));text('#model-title',v?.modelName||(stopped?'Inference stopped':'Model unknown'));text('#model-meta',serving?`${state.serving?.engine??'Inference'} running on ${plural(serving,'node')}`:`Live monitor | ${plural(count,'node')}`);
+  $('#status-desc').innerHTML=`<span>Nodes ${online}/${count}</span><span>Inference processes ${processes}/${count}</span><span>API ${v?.ok?'up':'no response'}</span>${watts.length?`<span>GPU power ${fixed(watts.reduce((sum,w)=>sum+w,0),1)} W${watts.length<count?` (${watts.length}/${count} nodes)`:''}</span>`:''}`;
+  text('#updated-at',clockTime(state.updatedAt));text('#model-title',v?.modelName||(stopped?'Inference stopped':'Model unknown'));text('#model-meta',serving?`${state.serving?.engine??'Inference'} running on ${plural(serving,'node')}`:`Live monitor | ${plural(scope.length,'node')}`);
   document.title=v?.modelName?`${v.modelName} | Spark Scope`:'Spark Scope';
   const empty=stopped?'stopped':UNKNOWN,value=(number,formatter=fixed)=>v?.ok?formatter(number):empty;
   text('#speed',value(v?.outputTokensPerSecond));text('#legend-speed',value(v?.outputTokensPerSecond));text('#avg',fixed(state.historyStats?.activeOutputTokensPerSecond));text('#queue',value(v?.waitingRequests,n=>fixed(n,0)));
   document.querySelectorAll('[data-field]').forEach(el=>{const key=el.dataset.field;let result=empty;if(v?.ok){if(key==='requests')result=`${fixed(v.runningRequests,0)} / ${fixed(v.waitingRequests,0)}`;else if(key.endsWith('Seconds'))result=duration(v[key]);else if(key.endsWith('Percent'))result=fixed(v[key],1,'%');else result=tokenRate(v[key])}el.textContent=result});
   metas.forEach(meta=>renderNode(meta,nodes[meta.id]));renderLinks(state);renderCharts(state);renderToday(state.usage);
 }
+// One button per model server: its model, output rate and boxes. The picked one drives the panels below.
+const SERVER_LEVELS={healthy:'good',degraded:'warn',offline:'crit',starting:'idle'};
+function renderServers(state) {
+  const list=state.servers??[],nav=$('#servers');nav.hidden=!list.length;if(!list.length)return;
+  // An id the server does not know (renamed in topology.json) falls back to the server's pick.
+  if(state.server&&!list.some(server=>server.id===selectedServer))selectedServer=state.server;
+  const html=list.map(server=>{const idle=server.inferenceState==='stopped',level=idle?'idle':!server.ok?'crit':SERVER_LEVELS[server.status]??'idle';
+    const model=server.modelName??(idle?'Idle, no model loaded':'No response');const boxes=server.nodes.map(id=>metas.find(m=>m.id===id)?.name??id).join(' | ');
+    const rate=server.ok?`<b class="num">${tokenRate(server.outputTokensPerSecond)}</b>`:'';const queue=server.ok&&finite(server.runningRequests)?`<small>${fixed(server.runningRequests,0)} running | ${fixed(server.waitingRequests??0,0)} waiting</small>`:'';
+    return `<button data-server="${esc(server.id)}" aria-pressed="${server.id===state.server}"><span class="server-head"><i data-level="${level}"></i><strong>${esc(server.name)}</strong><span>${esc(boxes)}</span></span><span class="server-model">${esc(model)}</span><span class="server-rate">${rate}${queue}</span></button>`}).join('');
+  if(nav.innerHTML!==html)nav.innerHTML=html;
+}
+$('#servers').addEventListener('click',event=>{const button=event.target.closest('[data-server]');if(!button||button.dataset.server===selectedServer)return;
+  selectedServer=button.dataset.server;try{localStorage.setItem('spark-scope-server',selectedServer)}catch{}
+  // The output chart and ledger belong to the server: fetch its full history and month instead of merging into the last one's.
+  historyRange=null;history=[];monthLoadedAt=0;$('#servers').querySelectorAll('[data-server]').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));
+  void refresh();if(!$('#tokens').hidden)void refreshMonth(true)});
 function failedState() {
   latest=null;
   $('#shell').classList.add('stale');$('.status').className='status error';text('#status-title','Spark Scope server not responding');text('#status-desc','Live values read as unknown until the connection returns.');
   metas.forEach(meta=>renderNode(meta,null));renderLinks(null);renderToday(null);for(const id of ['speed','legend-speed','avg','queue'])text('#'+id,UNKNOWN);document.querySelectorAll('[data-field]').forEach(el=>el.textContent=UNKNOWN);$('#plot-note').hidden=false;$('#plot-note').textContent='Lost the connection to the server. Reconnecting…';
 }
 async function refresh() {
-  if(collecting)return;collecting=true;const requestedRange=range,full=historyRange!==requestedRange||Date.now()-historyAt>=HISTORY_REFRESH_MS;
+  if(collecting)return;collecting=true;const requestedRange=range,requestedServer=selectedServer,full=historyRange!==requestedRange||Date.now()-historyAt>=HISTORY_REFRESH_MS;
   let data=null;const timeout=timeoutSignal(8000);
-  try{const res=await fetch(`/api/state?minutes=${requestedRange}${full?'':'&history=0'}`,{cache:'no-store',signal:timeout.signal});if(!res.ok)throw new Error('HTTP '+res.status);data=await res.json()}
+  try{const res=await fetch(`/api/state?minutes=${requestedRange}${full?'':'&history=0'}${serverQuery()}`,{cache:'no-store',signal:timeout.signal});if(!res.ok)throw new Error('HTTP '+res.status);data=await res.json()}
   catch{if(requestedRange===range)failedState()}
   finally{timeout.done()}
   try{
-    if(data&&requestedRange===range){
+    if(data&&requestedRange===range&&requestedServer===selectedServer){
       if(full){history=data.history??[];historyAt=Date.now();historyRange=requestedRange}else history=mergeLivePoint(history,livePoint(data),requestedRange*60_000);
       renderState({...data,history});
     }
   }catch(error){
     // A drawing problem is not a lost connection: keep the last good view and say what broke.
     if(error?.message==='stale data')failedState();else console.error('Spark Scope could not draw the latest state:',error);
-  }finally{collecting=false;if(requestedRange!==range)void refresh()}
+  }finally{collecting=false;if(requestedRange!==range||requestedServer!==selectedServer)void refresh()}
 }
 
 function rebuildMonths() {
@@ -171,7 +199,7 @@ function clearMonth(message,isError=false) {
 async function refreshMonth(force=false) {
   if(!force&&(monthController||Date.now()-monthLoadedAt<10000))return;
   const sequence=++monthSequence,month=selectedMonth;monthController?.abort();const controller=new AbortController();monthController=controller;const timer=setTimeout(()=>controller.abort(),8000);
-  try{const res=await fetch('/api/usage?month='+encodeURIComponent(month),{cache:'no-store',signal:controller.signal});if(!res.ok)throw new Error('HTTP '+res.status);const payload=validateMonth(await res.json(),month);if(sequence===monthSequence){renderMonth(payload);monthLoadedAt=Date.now()}}catch{if(sequence===monthSequence)clearMonth('Could not load the monthly ledger. Retrying…',true)}finally{clearTimeout(timer);if(sequence===monthSequence)monthController=null}
+  try{const res=await fetch('/api/usage?month='+encodeURIComponent(month)+serverQuery(),{cache:'no-store',signal:controller.signal});if(!res.ok)throw new Error('HTTP '+res.status);const payload=validateMonth(await res.json(),month);if(sequence===monthSequence){renderMonth(payload);monthLoadedAt=Date.now()}}catch{if(sequence===monthSequence)clearMonth('Could not load the monthly ledger. Retrying…',true)}finally{clearTimeout(timer);if(sequence===monthSequence)monthController=null}
 }
 function selectTab(btn,updateHash=true) {
   document.querySelectorAll('[role=tab]').forEach(b=>{b.setAttribute('aria-selected',String(b===btn));b.tabIndex=b===btn?0:-1;$('#'+b.getAttribute('aria-controls')).hidden=b!==btn});

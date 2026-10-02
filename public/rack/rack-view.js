@@ -148,7 +148,8 @@ export function nodeView(meta, node, { inferenceOk = false, lastOkAt = null, now
   // No GPU readings: a hung or failing nvidia-smi is a likely GPU fault; a missing one is a setup issue.
   const gpuProblem = node.gpu?.available === false ? GPU_PROBLEMS[node.gpu.status] ?? GPU_PROBLEMS.error : null;
   if (gpuProblem) (gpuProblem.level === "crit" ? crit : warn).push(gpuProblem.text);
-  if (node.systemState && node.systemState !== "running") warn.push(`system ${node.systemState}`);
+  // "starting" alone is DGX OS's stuck boot-splash wait on a headless box, not a fault (failed units still show).
+  if (node.systemState && !["running", "starting"].includes(node.systemState)) warn.push(`system ${node.systemState}`);
   if (node.failedUnits > 0) warn.push(`${node.failedUnits} failed ${node.failedUnits === 1 ? "unit" : "units"}`);
   // Nodes marked "inference": false in topology.json may idle while the API serves.
   if (inferenceOk && meta?.inference !== false && !node.inferenceProcessUp) warn.push("no inference process");

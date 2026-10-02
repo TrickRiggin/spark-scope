@@ -8,6 +8,8 @@ import {
   collectorCommand,
   knownEngine,
   metricsEngine,
+  multiplexOptions,
+  normalizeTensorfoldMetrics,
   parseNetworkLines,
   histogramQuantile,
   holdPrefillRates,
@@ -304,6 +306,17 @@ test("a local node runs the collector with bash directly; any other node goes ov
   assert.deepEqual(remote.args.slice(-2), ["spark-2", "bash -s"]);
 });
 
+test("polls share one SSH connection per node unless SPARK_SCOPE_SSH_MULTIPLEX=0", () => {
+  const options = multiplexOptions({ XDG_RUNTIME_DIR: "/run/user/1000" });
+  assert.ok(options.includes("ControlMaster=auto"));
+  assert.ok(options.includes("ControlPath=/run/user/1000/spark-scope-%C"));
+  // The master's keepalive must come before the per-poll one, because ssh keeps the first value it reads.
+  const args = collectorCommand({ host: "spark-2" }).args;
+  const keepalives = args.filter((arg) => arg.startsWith("ServerAliveInterval="));
+  assert.equal(keepalives[0], "ServerAliveInterval=5");
+  assert.deepEqual(multiplexOptions({ SPARK_SCOPE_SSH_MULTIPLEX: "0" }), []);
+});
+
 test("local collection runs on this machine and leaves what it cannot read unknown instead of failing", async () => {
   const node = await collectNode({ id: "1", name: "this", host: "local", local: true, interfaces: ["spkmissing0"] });
   assert.equal(node.ok, true, node.error ?? "");
@@ -535,4 +548,40 @@ test("a missing ssh binary is reported instead of crashing the poll", async () =
   const node = await withFakeCommand("unrelated", "exit 0", () => collectNode({ id: "9", name: "spark-9", host: "spark-9" }), { onlyFake: true });
   assert.equal(node.ok, false);
   assert.match(node.error, /ENOENT/);
+});
+
+test("TensorFold metrics map onto the fields vLLM reports, with the live reply counter as output", () => {
+  const metrics = parsePrometheus(`
+tensorfold:requests_running 2
+tensorfold:requests_waiting 1
+tensorfold:prompt_tokens_total 1000
+tensorfold:generation_tokens_total 50
+tensorfold:kv_cache_usage_ratio{pool="0"} 0.9
+tensorfold:mtp_drafted_total 200
+tensorfold:mtp_accepted_total 150
+tensorfold:time_to_first_token_seconds_bucket{le="1"} 3
+tensorfold:time_to_first_token_seconds_bucket{le="+Inf"} 4
+tensorfold:time_to_first_token_seconds_sum 5
+tensorfold:time_to_first_token_seconds_count 4
+tensorfold_health:requests_total 4
+tensorfold_health:completion_tokens_total 80
+tensorfold_health:cached_tokens_total 600
+tensorfold_health:prefill_seconds_total 2
+tensorfold_health:pool_tokens 1000
+tensorfold_health:pool_free_tokens 750
+`);
+  assert.equal(metricsEngine(metrics), "TensorFold");
+  normalizeTensorfoldMetrics(metrics);
+  // Replies still streaming count toward output, unlike tensorfold:generation_tokens_total.
+  assert.equal(metricValue(metrics, "vllm:generation_tokens_total"), 80);
+  assert.equal(metricValue(metrics, "vllm:num_requests_running"), 2);
+  assert.equal(metricValue(metrics, "vllm:num_requests_waiting"), 1);
+  // The shared pool's fill, not one stream's share of its context window.
+  assert.equal(metricValue(metrics, "vllm:kv_cache_usage_perc"), 0.25);
+  assert.equal(metricValue(metrics, "vllm:prompt_tokens_by_source_total", { source: "local_cache_hit" }), 600);
+  assert.equal(metricValue(metrics, "vllm:prompt_tokens_by_source_total", { source: "local_compute" }), 400);
+  assert.equal(metricValue(metrics, "vllm:request_prefill_time_seconds_sum"), 2);
+  assert.equal(metricValue(metrics, "vllm:spec_decode_num_accepted_tokens_total"), 150);
+  assert.equal(histogramQuantile(metrics, "vllm:time_to_first_token_seconds", 0.5), 0.6666666666666666);
+  assert.equal(knownEngine("tensorfold-glm53:v0.6.0"), "TensorFold");
 });

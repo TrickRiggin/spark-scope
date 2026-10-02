@@ -39,3 +39,15 @@ html,body{overflow-anchor:none}
 .brand span:empty{display:none}
 .badge[data-level="good"]{color:var(--green)}.badge[data-level="warn"]{color:var(--orange)}.badge[data-level="crit"]{color:var(--red)}
 .gauge strong.full{font-size:26px;padding-top:40px}
+/* Model servers strip (topology.json "servers"): one button per server; the pressed one drives the panels below. */
+.servers{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);border-bottom:1px solid var(--line)}.servers[hidden]{display:none}
+.servers button{all:unset;cursor:pointer;display:grid;grid-template-columns:1fr auto;grid-template-areas:"head rate" "model rate";gap:3px 14px;padding:11px 22px;box-shadow:1px 0 0 var(--line);color:var(--muted);font-size:11px;position:relative}
+.servers button:hover{background:var(--hover)}.servers button:focus-visible{outline:2px solid var(--blue);outline-offset:-2px}
+.servers button[aria-pressed=true]{background:var(--screen);color:var(--ink)}.servers button[aria-pressed=true]:after{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--blue)}
+.server-head{grid-area:head;display:flex;align-items:baseline;gap:10px;min-width:0}.server-head strong{font:700 15px var(--num-font);color:var(--ink)}.server-head span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.server-head i{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--muted);align-self:center}.server-head i[data-level=good]{background:var(--green)}.server-head i[data-level=warn]{background:var(--orange)}.server-head i[data-level=crit]{background:var(--red)}
+.server-model{grid-area:model;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.server-rate{grid-area:rate;display:flex;flex-direction:column;align-items:flex-end;justify-content:center}.server-rate b{font:700 22px var(--num-font);color:var(--ink)}
+/* Cards of the other servers step back; a hot card glows (--heat runs 0 at 55 °C to 1 at 90 °C). */
+.node.other-server{opacity:.55}.node{box-shadow:1px 0 0 var(--line),0 1px 0 var(--line),inset 0 0 calc(var(--heat,0) * 46px) color-mix(in srgb,var(--red) calc(var(--heat,0) * 55%),transparent);transition:box-shadow 1.5s}
+.node.hot h2:before{background:var(--red)}
+@media(max-width:760px){.servers{grid-auto-flow:row}.servers button{padding:10px 15px}}

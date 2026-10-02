@@ -127,12 +127,18 @@ export function fabricLayout(topology, { width = 380, height = 190, rx = 120, ry
   const ids = new Set(nodes.map(node => node.id));
   const links = (topology?.links ?? []).filter(link => link.nodes?.length === 2 && link.nodes.every(id => ids.has(id)));
   if (nodes.length < 2 || !links.length) return null;
-  const cx = width / 2, cy = height / 2, count = nodes.length;
+  // Nodes without a cable (a box serving on its own) stand in a column on the right; the cabled ones keep the ring.
+  const cabled = new Set(links.flatMap(link => link.nodes));
+  const ring = nodes.filter(node => cabled.has(node.id)), loose = nodes.filter(node => !cabled.has(node.id));
+  const shift = loose.length ? 50 : 0;
+  const cx = width / 2 - shift, cy = height / 2, count = ring.length;
+  const ringRx = loose.length ? Math.min(rx, cx - 30) : rx;
   const startAngle = count % 2 === 0 ? -90 - 180 / count : -90;
-  const at = Object.fromEntries(nodes.map((node, i) => {
+  const at = Object.fromEntries(ring.map((node, i) => {
     const angle = (startAngle + i * 360 / count) * Math.PI / 180;
-    return [node.id, [cx + rx * Math.cos(angle), cy + ry * Math.sin(angle)]];
+    return [node.id, [cx + ringRx * Math.cos(angle), cy + ry * Math.sin(angle)]];
   }));
+  loose.forEach((node, i) => { at[node.id] = [width - 40, height / 2 + (i - (loose.length - 1) / 2) * 50]; });
   const groups = new Map();
   for (const link of links) {
     const key = [...link.nodes].sort().join('\n');
@@ -153,7 +159,8 @@ export function fabricLayout(topology, { width = 380, height = 190, rx = 120, ry
     nodes: nodes.map((node, i) => ({ id: node.id, label: nodeLabel(node.id), x: at[node.id][0], y: at[node.id][1], color: COLORS[i % COLORS.length] })),
     links: lines,
     // Two nodes leave the centre on the cable, so the caption moves below them.
-    caption: { x: cx, y: count === 2 ? cy + 50 : cy + 4 },
+    // A triangle has no room inside for the caption, so it goes under the bottom edge.
+    caption: { x: cx, y: count === 2 ? cy + 50 : count === 3 ? cy + ry / 2 + 24 : cy + 4 },
   };
 }
 
