@@ -51,3 +51,19 @@ html,body{overflow-anchor:none}
 .node.other-server{opacity:.55}.node{box-shadow:1px 0 0 var(--line),0 1px 0 var(--line),inset 0 0 calc(var(--heat,0) * 46px) color-mix(in srgb,var(--red) calc(var(--heat,0) * 55%),transparent);transition:box-shadow 1.5s}
 .node.hot h2:before{background:var(--red)}
 @media(max-width:760px){.servers{grid-auto-flow:row}.servers button{padding:10px 15px}}
+/* Y-axis labels and hover readouts on the charts. */
+.chart-box{position:relative}
+.y-axis{position:absolute;inset:0;pointer-events:none;z-index:1}
+.y-axis span{position:absolute;left:0;right:0;font:10px var(--num-font);color:var(--muted);padding:1px 6px}
+.y-axis span.bottom{border-bottom:1px dashed var(--line)}.y-axis span.top{border-top:1px dashed var(--line)}
+.plot .y-axis span{padding-left:12px}
+.hover-line{position:absolute;top:0;bottom:0;width:1px;background:var(--muted);pointer-events:none;z-index:2}.hover-line[hidden],.chart-tip[hidden]{display:none}
+.plot .hover-line{bottom:25px;top:auto;height:140px}
+.chart-tip{position:absolute;top:8px;z-index:3;pointer-events:none;background:var(--paper);border:1px solid var(--line);box-shadow:0 2px 8px rgba(0,0,0,.18);padding:7px 9px;font-size:11px;color:var(--muted);white-space:nowrap}
+.plot .chart-tip{top:auto;bottom:40px}
+.chart-tip .tip-time{font-weight:700;color:var(--ink);margin-bottom:4px}
+.chart-tip div:not(.tip-time){display:flex;align-items:center;gap:6px;line-height:1.6}
+.chart-tip i{display:inline-block;width:12px;height:2px}.chart-tip i.blank{background:none}
+.chart-tip b{color:var(--ink);font:700 12px var(--num-font);min-width:62px;text-align:right}
+[data-chart]{cursor:crosshair}
+.y-axis em{font-style:normal;background:color-mix(in srgb,var(--screen) 80%,transparent);padding:0 3px}.trend .y-axis em{background:color-mix(in srgb,var(--paper) 80%,transparent)}

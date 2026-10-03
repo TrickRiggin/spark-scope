@@ -90,10 +90,13 @@ function renderLinks(state) {
 function renderCharts(state) {
   const history=state.history||[],end=Date.now(),start=end-range*60_000;
   const rates=history.map(p=>p.outputTokensPerSecond).filter(finite),avg=state.historyStats?.activeOutputTokensPerSecond;
-  const max=Math.max(1,...rates,finite(avg)?avg:0)*1.15;
+  const max=niceCeil(Math.max(1,...rates,finite(avg)?avg:0)*1.1);
   const d=chartPath(history,'outputTokensPerSecond',{start,end,min:0,max,top:4,bottom:22});$('#output-line').setAttribute('d',d);$('#output-fill').setAttribute('d','');
   $('#avg-line').setAttribute('d',finite(avg)?chartPath([{at:start,value:avg},{at:end,value:avg}],'value',{start,end,min:0,max,top:4,bottom:22}):'');
   const queueMax=Math.max(1,...history.map(p=>p.queue).filter(finite));$('#queue-line').setAttribute('d',chartPath(history,'queue',{start,end,min:0,max:queueMax,top:120,bottom:4}));
+  // Output axis: the plot is 140 px tall with 4 px above and 22 px below the data, drawn 25 px above the plot's bottom edge.
+  setAxis($('#output-axis'),[max,max/2,0].map(value=>({label:`${fixed(value,value>0&&value<10?1:0)} tok/s`,style:`bottom:${(25+22+(value/max)*(140-4-22)).toFixed(1)}px`,edge:'bottom'})));
+  chartContext.output={history,start,end};
   const label=value=>clockTime(value,{seconds:false});
   text('#range-start',label(start));text('#range-mid',label((start+end)/2));text('#range-end',label(end));
   $('#plot-note').hidden=rates.length>0;$('#plot-note').textContent=state.inferenceState==='stopped'?'The inference process is stopped.':'No output measurements yet.';
@@ -103,9 +106,50 @@ function renderCharts(state) {
     const pick=id=>point=>{const v=point.nodes?.[id]?.[field];return finite(v)?v/scale:null};
     const values=history.flatMap(point=>ids.map(id=>pick(id)(point))).filter(finite),low=kind==='temp'&&values.length?Math.min(...values)-2:0,high=values.length?Math.max(...values)+(kind==='temp'?2:5):1;
     $('#'+kind+'-chart').innerHTML=ids.map((id,index)=>`<path d="${chartPath(history,pick(id),{start,end,width:320,height:80,min:low,max:high})}" fill="none" stroke="${COLORS[index%COLORS.length]}" stroke-width="2" vector-effect="non-scaling-stroke"/>`).join('');
+    const box=document.querySelector(`.chart-box[data-chart="${kind}"]`),unit=kind==='temp'?' °C':' GiB';
+    setAxis(box.querySelector('.y-axis'),values.length?[{label:fixed(high,0)+unit,style:'top:0',edge:'top'},{label:fixed(low,0)+unit,style:'bottom:0',edge:'bottom'}]:[]);
+    chartContext[kind]={history,start,end,pick,ids,state};
     $('#'+kind+'-legend').innerHTML=metas.map((meta,index)=>{const node=state.nodes?.[meta.id];const value=!node?.ok?UNKNOWN:kind==='temp'?fixed(node.gpu?.temperature,0):gib(node.memory?.availableBytes);return `<span style="color:${COLORS[index%COLORS.length]}">${esc(meta.name)} <b class="num">${value}</b></span>`}).join('');
   }
 }
+// Y-axis labels sit over the chart in HTML: the SVGs stretch to their box, which would distort SVG text.
+// A round top for the output scale (10, 20, 25, 50, 100 ...), so its axis labels read cleanly.
+const niceCeil=value=>{const step=10**Math.floor(Math.log10(value));return [1,2,2.5,5,10].map(m=>m*step).find(n=>n>=value)};
+function setAxis(axis,ticks) {
+  const html=ticks.map(tick=>`<span class="${tick.edge}" style="${tick.style}"><em>${esc(tick.label)}</em></span>`).join('');
+  if(axis.innerHTML!==html)axis.innerHTML=html;
+}
+// Hover: a hairline snaps to the nearest sample under the pointer and a readout lists every series at that time,
+// so a value never has to be caught live.
+const chartContext={};
+function nearestPoint(context,fraction) {
+  const at=context.start+fraction*(context.end-context.start);let best=null;
+  for(const point of context.history)if(finite(point.at)&&(!best||Math.abs(point.at-at)<Math.abs(best.at-at)))best=point;
+  // Nothing within 3% of the range (a gap in the data): show nothing rather than a far-off sample.
+  return best&&Math.abs(best.at-at)<=(context.end-context.start)*0.03?best:null;
+}
+function tipRows(kind,point,context) {
+  if(kind==='output')return [['var(--blue)','Output',finite(point.outputTokensPerSecond)?`${fixed(point.outputTokensPerSecond,1)} tok/s`:UNKNOWN],['var(--orange)','Queue',finite(point.queue)?fixed(point.queue,0):UNKNOWN],[null,'Running',finite(point.runningRequests)?fixed(point.runningRequests,0):UNKNOWN]];
+  return context.ids.map((id,index)=>{const value=context.pick(id)(point);return [COLORS[index%COLORS.length],metas.find(meta=>meta.id===id)?.name??id,finite(value)?(kind==='temp'?`${fixed(value,0)} °C`:`${fixed(value,1)} GiB`):UNKNOWN]});
+}
+function showTip(box,clientX) {
+  const kind=box.dataset.chart,context=chartContext[kind],svg=box.querySelector('svg'),line=box.querySelector('.hover-line'),tip=box.querySelector('.chart-tip');
+  const rect=svg.getBoundingClientRect(),fraction=(clientX-rect.left)/rect.width;
+  const point=context&&fraction>=0&&fraction<=1?nearestPoint(context,fraction):null;
+  if(!point){line.hidden=true;tip.hidden=true;return}
+  const boxRect=box.getBoundingClientRect(),x=rect.left-boxRect.left+(point.at-context.start)/(context.end-context.start)*rect.width;
+  line.hidden=false;line.style.left=`${x.toFixed(1)}px`;
+  // Built with textContent: node names come from topology.json.
+  tip.replaceChildren();const time=document.createElement('div');time.className='tip-time';time.textContent=clockTime(point.at);tip.append(time);
+  for(const [color,label,value] of tipRows(kind,point,context)){const row=document.createElement('div'),key=document.createElement('i'),strong=document.createElement('b'),name=document.createElement('span');if(color)key.style.background=color;else key.className='blank';strong.textContent=value;name.textContent=label;row.append(key,strong,name);tip.append(row)}
+  tip.hidden=false;const left=x+12+tip.offsetWidth>box.clientWidth?x-12-tip.offsetWidth:x+12;tip.style.left=`${Math.max(0,left).toFixed(1)}px`;
+}
+const hoverAt=new Map();
+document.querySelectorAll('[data-chart]').forEach(box=>{
+  box.addEventListener('pointermove',event=>{hoverAt.set(box,event.clientX);showTip(box,event.clientX)});
+  box.addEventListener('pointerleave',()=>{hoverAt.delete(box);box.querySelector('.hover-line').hidden=true;box.querySelector('.chart-tip').hidden=true});
+});
+function refreshTips() { for(const [box,clientX] of hoverAt)showTip(box,clientX); }
 function renderToday(usage) {
   for(const selector of ['[data-usage]','[data-today]'])document.querySelectorAll(selector).forEach(el=>{const key=el.dataset.usage||el.dataset.today;const value=usage?.error||usage?.reported?.[key]===false?null:usage?.today?.[key];el.textContent=key==='requests'?fixed(value,0):compact(value);el.title=finite(value)?value.toLocaleString('en-US'):''});
   document.querySelectorAll('[data-ledger-zone]').forEach(el=>{el.textContent=ledgerTimeZone?`Days in ${ledgerTimeZone}`:''});
@@ -127,7 +171,7 @@ function renderState(state) {
   const empty=stopped?'stopped':UNKNOWN,value=(number,formatter=fixed)=>v?.ok?formatter(number):empty;
   text('#speed',value(v?.outputTokensPerSecond));text('#legend-speed',value(v?.outputTokensPerSecond));text('#avg',fixed(state.historyStats?.activeOutputTokensPerSecond));text('#queue',value(v?.waitingRequests,n=>fixed(n,0)));
   document.querySelectorAll('[data-field]').forEach(el=>{const key=el.dataset.field;let result=empty;if(v?.ok){if(key==='requests')result=`${fixed(v.runningRequests,0)} / ${fixed(v.waitingRequests,0)}`;else if(key.endsWith('Seconds'))result=duration(v[key]);else if(key.endsWith('Percent'))result=fixed(v[key],1,'%');else result=tokenRate(v[key])}el.textContent=result});
-  metas.forEach(meta=>renderNode(meta,nodes[meta.id]));renderLinks(state);renderCharts(state);renderToday(state.usage);
+  metas.forEach(meta=>renderNode(meta,nodes[meta.id]));renderLinks(state);renderCharts(state);refreshTips();renderToday(state.usage);
 }
 // One button per model server: its model, output rate and boxes. The picked one drives the panels below.
 const SERVER_LEVELS={healthy:'good',degraded:'warn',offline:'crit',starting:'idle'};

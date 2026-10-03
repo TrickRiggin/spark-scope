@@ -48,6 +48,7 @@ This fork runs the Grove's dashboard on Sequoia. It adds:
 - **TensorFold metrics.** Mia's TensorFold engine is read alongside vLLM and SGLang. Output tok/s comes from its live reply counter, KV cache from its shared cache pool. TPOT p95 is unknown (it has no per-token histogram).
 - **One SSH connection per node.** Polls ride a shared SSH connection (OpenSSH `ControlMaster`) instead of logging in every five seconds; on DGX OS each login grows polkitd. `SPARK_SCOPE_SSH_MULTIPLEX=0` turns it off; `SPARK_SCOPE_SSH_CONTROL_DIR` moves the sockets (default `$XDG_RUNTIME_DIR`).
 - **Heat.** Node cards glow red as the GPU warms (from 55 °C, full at 90 °C).
+- **Chart axes and hover.** The output, temperature and memory charts carry Y-axis labels, and hovering shows the time and every series' value at the nearest sample.
 - **Smaller fixes.** A node with no cable sits beside the ring in the diagram, and systemd's `starting` state (DGX OS's stuck boot-splash wait on headless boxes) is no longer reported as a fault.
 
 ## Installation
