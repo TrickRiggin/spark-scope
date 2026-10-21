@@ -30,11 +30,12 @@ test("without servers there is one server on every node at the configured API UR
 
 test("an unloaded box is idle while another server serves; a real fault names its server", () => {
   const glm = { server: { id: "glm", name: "GLM" }, status: "healthy", message: "Nodes and inference API healthy", inferenceState: "serving" };
-  const idle = { server: { id: "p", name: "Maple" }, status: "degraded", message: "1 node connected, no inference process", inferenceState: "stopped" };
+  const idle = { server: { id: "p", name: "Maple" }, status: "healthy", message: "1 node connected, idle (no model loaded)", inferenceState: "stopped" };
   assert.deepEqual(combineServerStatus([glm, idle]), { status: "healthy", message: "1 model server healthy, Maple idle" });
   const broken = { ...glm, status: "degraded", message: "QSFP link needs attention" };
   assert.deepEqual(combineServerStatus([broken, idle]), { status: "degraded", message: "GLM: QSFP link needs attention" });
   assert.equal(combineServerStatus([glm, { ...glm, server: { id: "q", name: "Qwen" } }]).message, "All 2 model servers healthy");
+  assert.deepEqual(combineServerStatus([idle, { ...idle, server: { id: "r", name: "Ring" } }]), { status: "healthy", message: "Maple, Ring idle, no model loaded" });
 });
 
 test("a node without a cable stands beside the ring in the diagram", () => {

@@ -52,7 +52,7 @@ test('a single node has no links and is judged on the node and the API alone', (
   // One serving node is not labelled with a node count.
   assert.equal(servingSummary(nodes, { ok: true, engine: 'vLLM' }, topology).label, 'vLLM');
   nodes['1'].inferenceProcessUp = false; nodes['1'].inferenceProcessReady = false;
-  assert.equal(clusterStatus(nodes, { ok: false }, links, topology).message, '1 node connected, no inference process');
+  assert.equal(clusterStatus(nodes, { ok: false }, links, topology).message, '1 node connected, idle (no model loaded)');
   assert.equal(clusterStatus({ 1: { ok: false, collected: true, id: '1' } }, { ok: false }, links, topology).message, 'Cannot reach the node');
 });
 
@@ -106,7 +106,8 @@ test('a cable that is not installed yet reads as pending, not as a broken link',
   assert.equal(pending['1-2'].a.rateGbps, null);
   const status = clusterStatus(nodes, { ok: false }, pending, ring({ collect1: false, cabled12: false }));
   assert.equal(status.inferenceState, 'stopped');
-  assert.equal(status.message, '3 nodes connected, no inference process');
+  assert.equal(status.message, '3 nodes connected, idle (no model loaded)');
+  assert.equal(status.status, 'healthy');
   // Once the cable is expected, the same dark port is a broken link.
   const expected = buildRingLinks(nodes, ring({ collect1: false, cabled12: true }));
   assert.equal(expected['1-2'].state, 'down');
