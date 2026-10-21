@@ -4,12 +4,12 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
-import { collectNode, uncollectedNode, InferenceCollector, applyNetworkRates } from "./lib/collectors.mjs";
-import { buildRingLinks, clusterStatus, combineServerStatus, servingSummary, unlistedServingNodes, DEFAULT_LINK_MIN_GBPS } from "./lib/cluster.mjs";
+import { collectNode, uncollectedNode, InferenceCollector, applyNetworkRates, applyGpuMemoryFallback } from "./lib/collectors.mjs";
+import { buildRingLinks, clusterStatus, serverState, servingSummary, DEFAULT_LINK_MIN_GBPS, STARTING_MESSAGE } from "./lib/cluster.mjs";
 import { downsampleHistory, summarizeHistory } from "./lib/history.mjs";
 import { hostAllowed, hostRules, SECURITY_HEADERS } from "./lib/http-guard.mjs";
 import { publicState } from "./lib/public-state.mjs";
-import { loadTopology, nodeInterfaces, publicTopology, serverTopology, topologyServers } from "./lib/topology.mjs";
+import { loadTopology, nodeInterfaces, publicTopology, topologyServers } from "./lib/topology.mjs";
 
 // node:sqlite (the token ledger) needs Node 22.13 or later; say so instead of failing on the import.
 const [major, minor] = process.versions.node.split(".").map(Number);
@@ -21,6 +21,10 @@ const { UsageStore } = await import("./lib/usage-store.mjs");
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_ROOT = path.join(ROOT, "public");
+// Shown in the settings dialog's About section.
+const VERSION = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8")).version;
+// When a rack panel last polled this server (see /api/state); null until one does.
+let rackSeenAt = null;
 
 // Whole numbers only: "2s" or "1e4" are rejected instead of being read as 2 or 1.
 function positiveInteger(name, fallback, minimum = 1) {
@@ -39,6 +43,18 @@ function portNumber(name, fallback) {
   return value;
 }
 
+// Checked here because fetch would otherwise put a malformed URL, or one with a password, into its error messages,
+// which reach the pages. The value itself is never printed.
+function inferenceUrl(name, fallback) {
+  const raw = process.env[name] || fallback;
+  let url = null;
+  try { url = new URL(raw); } catch { /* reported below */ }
+  if (!url || !["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+    throw new Error(`${name} must be an http:// or https:// URL without a user name or password, such as http://127.0.0.1:8000`);
+  }
+  return raw;
+}
+
 function validTimeZone(timeZone) {
   if (!timeZone) return undefined;
   try {
@@ -53,7 +69,7 @@ const dataHome = process.env.XDG_DATA_HOME || path.join(homedir(), ".local", "sh
 const config = {
   host: process.env.SPARK_SCOPE_HOST || "127.0.0.1",
   port: portNumber("SPARK_SCOPE_PORT", 8787),
-  apiUrl: process.env.SPARK_SCOPE_API_URL || "http://127.0.0.1:8000",
+  apiUrl: inferenceUrl("SPARK_SCOPE_API_URL", "http://127.0.0.1:8000"),
   nodeIntervalMs: positiveInteger("SPARK_SCOPE_NODE_INTERVAL_MS", 5000, 1000),
   apiIntervalMs: positiveInteger("SPARK_SCOPE_API_INTERVAL_MS", 2000, 500),
   usageDbPath: process.env.SPARK_SCOPE_USAGE_DB || path.join(dataHome, "spark-scope", "usage.sqlite"),
@@ -69,105 +85,113 @@ const HISTORY_LIMIT = Math.ceil(HISTORY_WINDOW_MS / Math.min(config.nodeInterval
 const topology = loadTopology();
 const nodeDefinitions = topology.nodes.map((node) => ({ ...node, interfaces: nodeInterfaces(topology, node.id) }));
 
-// One inference collector, token ledger and history per model server. Without "servers" in topology.json there is
-// one server on every node at SPARK_SCOPE_API_URL, with the ledger at SPARK_SCOPE_USAGE_DB, as upstream.
-const usageDbPath = (server) => (server.implicit ? config.usageDbPath
-  : path.join(path.dirname(config.usageDbPath), `usage-${server.id}.sqlite`));
-const servers = topologyServers(topology, config.apiUrl).map((definition) => {
-  const server = {
-    definition,
-    topology: serverTopology(topology, definition),
-    collector: new InferenceCollector(definition.api),
-    usageStore: null,
-    usageOpenError: null,
-    inference: null,
-    serving: null,
-    usage: null,
-    history: [],
-    status: "starting",
-    message: "Waiting for the first measurements",
-    inferenceState: "unknown",
-    // The model of the last successful poll: a restart in between (failed polls) does not hide a model switch.
-    lastServedModel: null,
-    // Ledger errors repeat every poll; log a message when it changes and at most every ten minutes otherwise.
-    lastUsageError: { message: null, at: 0 },
-  };
-  // A ledger that cannot be opened (corrupt file, wrong permissions) turns off token counting, not the dashboard.
-  try {
-    server.usageStore = new UsageStore(usageDbPath(definition), { timeZone: config.timeZone });
-  } catch (error) {
-    server.usageOpenError = `Token ledger unavailable: ${error.message}`;
-    console.error(`${server.usageOpenError} (${usageDbPath(definition)})`);
-  }
-  server.usage = server.usageStore ? server.usageStore.summary() : unavailableUsage(server);
-  return server;
-});
-function unavailableUsage(server) {
-  return { persistent: false, error: server.usageOpenError, updatedAt: new Date().toISOString() };
+// One inference API per model server: those listed under "servers" in topology.json, or SPARK_SCOPE_API_URL for every
+// node. The first server's sessions keep the ledger's plain keys; the others prefix their id (see usage-store.mjs).
+for (const server of topology.servers ?? []) {
+  if (server.apiKeyEnv && !process.env[server.apiKeyEnv]) console.warn(`Server ${server.id}: its apiKeyEnv variable is empty or unset`);
 }
-const serverById = (id) => servers.find((server) => server.definition.id === id) ?? servers[0];
+const servers = topologyServers(topology, config.apiUrl).map((server, index) => ({
+  ...server,
+  collector: new InferenceCollector(server.api, { apiKeyEnv: server.apiKeyEnv }),
+  keyPrefix: index === 0 ? "" : `${server.id}:`,
+  lastServedModel: null,
+}));
+const apiKeyEnvNames = servers.map(server => server.apiKeyEnv).filter(Boolean);
+// A ledger that cannot be opened (corrupt file, wrong permissions) turns off token counting, not the dashboard.
+let usageStore = null;
+let usageOpenError = null;
+try {
+  usageStore = new UsageStore(config.usageDbPath, { timeZone: config.timeZone });
+} catch (error) {
+  usageOpenError = `Token ledger unavailable: ${error.message}`;
+  console.error(`${usageOpenError} (${config.usageDbPath})`);
+}
+const unavailableUsage = () => ({ persistent: false, error: usageOpenError, updatedAt: new Date().toISOString() });
 const state = {
   status: "starting",
-  message: "Waiting for the first measurements",
+  message: STARTING_MESSAGE,
+  messageKey: "status.starting",
+  messageParams: {},
+  inference: null,
+  // Per model server: its nodes, its API reading, which of its nodes serve and its inference state (no API URLs).
+  servers: servers.map(({ id, name, nodes, implicit }) => ({ id, name, nodes, implicit: Boolean(implicit), inference: null, serving: null, inferenceState: "unknown" })),
   topology: publicTopology(topology),
   nodes: Object.fromEntries(topology.nodes.map((node) => [node.id, null])),
   ringLinks: {},
+  serving: null,
+  inferenceState: "unknown",
+  history: [],
+  usage: usageStore ? usageStore.summary() : unavailableUsage(),
   startedAt: new Date().toISOString(),
   updatedAt: null,
 };
 
 let collectingNodes = false;
-let collectingInference = false;
+// When the last chart point was added (one per poll interval, whichever server answers first).
+let lastHistoryAt = 0;
+// Ledger errors repeat every poll; log a message when it changes and at most every ten minutes otherwise.
+let lastUsageError = { message: null, at: 0 };
 // Full node collection errors go to the log when they change; the browser only gets a short reason.
 const lastNodeErrors = new Map();
+const lastGpuMemoryKinds = new Map();
+const lastNodePlatforms = new Map();
+const lastNodeBatteries = new Map();
 // Refused Host names, logged once each so a missing SPARK_SCOPE_ALLOWED_HOSTS entry is easy to spot.
 const refusedHosts = new Set();
 
 function refreshClusterStatus() {
   state.ringLinks = buildRingLinks(state.nodes, topology, { minGbps: config.linkMinGbps });
-  for (const server of servers) {
-    const links = Object.fromEntries(server.topology.links.map((link) => [link.id, state.ringLinks[link.id]]));
-    server.serving = servingSummary(state.nodes, server.inference, server.topology);
-    Object.assign(server, clusterStatus(state.nodes, server.inference, links, server.topology));
+  for (const server of state.servers) {
+    const members = new Set(server.nodes);
+    server.serving = servingSummary(state.nodes, server.inference, { nodes: topology.nodes.filter((meta) => members.has(meta.id)) });
+    server.inferenceState = serverState(server, state.nodes, topology).inferenceState;
   }
-  Object.assign(state, combineServerStatus(servers.map((server) => ({
-    server: server.definition, status: server.status, message: server.message, inferenceState: server.inferenceState,
-  }))));
-  // Cables between two servers' nodes, or to a node in no server, still count toward the overall status.
-  const shared = topology.links.filter((link) => !servers.some((server) => server.topology.links.includes(link)));
-  const sharedDown = shared.find((link) => !["pending", "unknown"].includes(state.ringLinks[link.id]?.state)
-    && !(state.ringLinks[link.id]?.state === "up" && !state.ringLinks[link.id]?.slow));
-  if (sharedDown && state.status === "healthy") Object.assign(state, { status: "degraded", message: "QSFP link needs attention" });
-  const unlisted = unlistedServingNodes(state.nodes, topology);
-  if (unlisted.length && state.status === "healthy") {
-    const names = unlisted.map((meta) => meta.name).join(", ");
-    Object.assign(state, { status: "degraded", message: `${names} ${unlisted.length === 1 ? "runs" : "run"} a model the layout does not list; update topology.json` });
-  }
+  // inference and serving are the first server's, for pages and scripts written for one server.
+  state.inference = state.servers[0].inference;
+  state.serving = state.servers[0].serving;
+  Object.assign(state, clusterStatus(state.nodes, state.servers, state.ringLinks, topology));
   state.updatedAt = new Date().toISOString();
 }
 
-function addHistoryPoint(server) {
-  const inference = server.inference;
-  if (!inference) return;
+// One server's chart fields, null while its API does not answer.
+function historyFields(inference) {
+  return {
+    outputTokensPerSecond: inference?.ok ? inference.outputTokensPerSecond ?? null : null,
+    promptTokensPerSecond: inference?.ok ? inference.promptTokensPerSecond ?? null : null,
+    runningRequests: inference?.ok ? inference.runningRequests ?? null : null,
+    queue: inference?.ok ? inference.waitingRequests ?? null : null,
+  };
+}
+
+function addHistoryPoint() {
+  if (state.servers.every((server) => !server.inference)) return;
+  const each = state.servers.map((server) => historyFields(server.inference));
+  // The chart fields are the sum over the servers that answered (with one server, its own values).
+  const sum = (field) => {
+    const values = each.map((fields) => fields[field]).filter(Number.isFinite);
+    return values.length ? values.reduce((total, value) => total + value, 0) : null;
+  };
   const point = {
     at: Date.now(),
-    outputTokensPerSecond: inference.ok ? inference.outputTokensPerSecond : null,
-    promptTokensPerSecond: inference.ok ? inference.promptTokensPerSecond : null,
-    runningRequests: inference.ok ? inference.runningRequests : null,
-    queue: inference.ok ? inference.waitingRequests : null,
+    outputTokensPerSecond: sum("outputTokensPerSecond"),
+    promptTokensPerSecond: sum("promptTokensPerSecond"),
+    runningRequests: sum("runningRequests"),
+    queue: sum("queue"),
+    // With several servers, each one's own fields by server id.
+    ...(state.servers.length > 1 ? { servers: Object.fromEntries(state.servers.map((server, index) => [server.id, each[index]])) } : {}),
     // Per node id: { temperature, memoryAvailableBytes }. Unreachable or uncollected nodes stay null.
     nodes: Object.fromEntries(topology.nodes.map(({ id }) => {
       const node = state.nodes[id];
       return [id, {
         temperature: node?.ok ? node.gpu?.temperature ?? null : null,
-        memoryAvailableBytes: node?.ok ? node.memory?.availableBytes ?? null : null,
+        memoryAvailableBytes: node?.ok ? node.gpu?.memory?.availableBytes ?? null : null,
       }];
     })),
   };
-  server.history.push(point);
+  state.history.push(point);
   const cutoff = Date.now() - HISTORY_WINDOW_MS;
-  while (server.history.length > HISTORY_LIMIT || (server.history[0] && server.history[0].at < cutoff)) {
-    server.history.shift();
+  while (state.history.length > HISTORY_LIMIT || (state.history[0] && state.history[0].at < cutoff)) {
+    state.history.shift();
   }
 }
 
@@ -176,11 +200,23 @@ async function collectNodes() {
   collectingNodes = true;
   try {
     const snapshots = await Promise.all(nodeDefinitions.map((definition) => (
-      definition.collect ? collectNode(definition) : uncollectedNode(definition))));
+      definition.collect ? collectNode(definition, { apiKeyEnvNames }) : uncollectedNode(definition))));
     for (let index = 0; index < nodeDefinitions.length; index += 1) {
       const definition = nodeDefinitions[index];
       const previous = state.nodes[definition.id];
-      state.nodes[definition.id] = applyNetworkRates(snapshots[index], previous);
+      const next = snapshots[index];
+      if (next.platform) lastNodePlatforms.set(definition.id, next.platform);
+      else if (next.ok) { lastNodePlatforms.delete(definition.id); lastNodeBatteries.delete(definition.id); }
+      else if (lastNodePlatforms.has(definition.id)) next.platform = lastNodePlatforms.get(definition.id);
+      if (typeof next.power?.hasBattery === "boolean") lastNodeBatteries.set(definition.id, next.power.hasBattery);
+      if (next.platform === "darwin") {
+        next.power = { systemWatts: null, batteryPercent: null, onAC: null, ...next.power, hasBattery: next.power?.hasBattery ?? lastNodeBatteries.get(definition.id) ?? null };
+        if (!next.ok) next.gpu = { memory: { kind: lastGpuMemoryKinds.get(definition.id) ?? null, totalBytes: null, usedBytes: null, availableBytes: null } };
+      }
+      const kind = next.gpu?.memory?.kind;
+      if (kind) lastGpuMemoryKinds.set(definition.id, kind);
+      else applyGpuMemoryFallback(next, lastGpuMemoryKinds.get(definition.id));
+      state.nodes[definition.id] = applyNetworkRates(next, previous);
       const error = snapshots[index]?.error ?? null;
       if (error !== (lastNodeErrors.get(definition.id) ?? null)) {
         console.error(error ? `Node ${definition.name}: ${error}` : `Node ${definition.name}: collecting again`);
@@ -193,74 +229,66 @@ async function collectNodes() {
   }
 }
 
-function recordInference(server, next) {
-  if (next.ok && next.modelName) {
-    if (server.lastServedModel && server.lastServedModel !== next.modelName) server.history = [];
-    server.lastServedModel = next.modelName;
+// A model switch starts that server's chart again: with one server the whole chart (as the averages mix models
+// otherwise), with several only the switched server's own series.
+function restartChart(index) {
+  if (servers.length === 1) {
+    state.history = [];
+    return;
   }
-  server.inference = next;
+  const id = servers[index].id;
+  for (const point of state.history) if (point.servers?.[id]) point.servers[id] = historyFields(null);
+}
+
+// Books one server's reading in the ledger. Today's totals and the reported counters cover every server; session,
+// modelName and processStartedAt describe the first server's run, like inference.
+function bookUsage(index, next) {
+  if (!usageStore) {
+    state.usage = unavailableUsage();
+    return;
+  }
   try {
-    if (!server.usageStore) {
-      server.usage = unavailableUsage(server);
-    } else if (next.ok) {
-      server.usage = server.usageStore.record(next);
-    } else {
-      const { session, modelName, processStartedAt } = server.usage;
-      server.usage = { ...server.usageStore.summary(), session, modelName, processStartedAt };
-    }
+    const result = next.ok ? usageStore.record(next, Date.now(), { keyPrefix: servers[index].keyPrefix }) : null;
+    const own = index === 0 && result ? result : state.usage;
+    state.usage = { ...(result ?? usageStore.summary()), session: own.session, modelName: own.modelName, processStartedAt: own.processStartedAt };
   } catch (error) {
-    server.usage = { ...server.usage, error: error.message, updatedAt: new Date().toISOString() };
+    state.usage = { ...state.usage, error: error.message, updatedAt: new Date().toISOString() };
     const now = Date.now();
-    if (error.message !== server.lastUsageError.message || now - server.lastUsageError.at > 10 * 60_000) {
-      console.error(`Token usage store${server.definition.implicit ? "" : ` (${server.definition.name})`}: ${error.message}`);
-      server.lastUsageError = { message: error.message, at: now };
+    if (error.message !== lastUsageError.message || now - lastUsageError.at > 10 * 60_000) {
+      console.error(`Token usage store: ${error.message}`);
+      lastUsageError = { message: error.message, at: now };
     }
   }
 }
 
-async function collectInference() {
-  if (collectingInference) return;
-  collectingInference = true;
+// Each server is polled on its own, so one that does not answer (up to the 4 s request timeout) does not hold up the
+// others.
+async function collectServer(index) {
+  const server = servers[index];
+  if (server.collecting) return;
+  server.collecting = true;
   try {
-    const readings = await Promise.all(servers.map((server) => server.collector.collect()));
-    servers.forEach((server, index) => recordInference(server, readings[index]));
+    const next = await server.collector.collect();
+    // The model of the server's last successful poll: a restart in between (failed polls) does not hide a switch.
+    if (next.ok && next.modelName) {
+      if (server.lastServedModel && server.lastServedModel !== next.modelName) restartChart(index);
+      server.lastServedModel = next.modelName;
+    }
+    state.servers[index].inference = next;
+    bookUsage(index, next);
     refreshClusterStatus();
-    for (const server of servers) addHistoryPoint(server);
+    // One chart point per poll interval, with the latest reading of every server.
+    if (servers.length === 1 || Date.now() - lastHistoryAt >= config.apiIntervalMs * 0.8) {
+      addHistoryPoint();
+      lastHistoryAt = Date.now();
+    }
   } finally {
-    collectingInference = false;
+    server.collecting = false;
   }
 }
 
-// The servers strip: each model server's headline numbers, so the page can show them all and pick one.
-function serverSummaries() {
-  return servers.filter((server) => !server.definition.implicit).map(({ definition, inference, serving, status, message, inferenceState }) => ({
-    id: definition.id,
-    name: definition.name,
-    nodes: definition.nodes,
-    ok: Boolean(inference?.ok),
-    engine: serving?.engine ?? inference?.engine ?? null,
-    modelName: inference?.ok ? inference.modelName ?? null : null,
-    outputTokensPerSecond: inference?.ok ? inference.outputTokensPerSecond ?? null : null,
-    runningRequests: inference?.ok ? inference.runningRequests ?? null : null,
-    waitingRequests: inference?.ok ? inference.waitingRequests ?? null : null,
-    status,
-    message,
-    inferenceState,
-  }));
-}
-
-// What /api/state reports for one server: the shared node and link state, with that server's inference, serving,
-// ledger and history in the fields the pages already read.
-function serverState(server) {
-  return {
-    ...state,
-    server: server.definition.implicit ? null : server.definition.id,
-    servers: serverSummaries(),
-    inference: server.inference,
-    serving: server.serving,
-    inferenceState: server.inferenceState,
-    usage: server.usage,
-  };
+function collectInference() {
+  return Promise.all(servers.map((server, index) => collectServer(index)));
 }
 
 const contentTypes = new Map([
@@ -339,16 +367,20 @@ async function handle(request, response) {
     return;
   }
   if (url.pathname === "/api/state") {
+    // The rack panel marks its polls, so the web page can offer rack settings only where a rack panel is in use.
+    // Only the time is kept (in memory), not who asked.
+    if (url.searchParams.get("from") === "rack") rackSeenAt = new Date().toISOString();
     const requestedMinutes = Number(url.searchParams.get("minutes") || 60);
     const minutes = [15, 60, 360].includes(requestedMinutes) ? requestedMinutes : 60;
-    const server = serverById(url.searchParams.get("server"));
-    const history = server.history.filter(point => point.at >= Date.now() - minutes * 60_000);
+    const history = state.history.filter(point => point.at >= Date.now() - minutes * 60_000);
     // history=0 leaves out the samples: pages poll every two seconds and fetch the full history only now and then.
     const withHistory = url.searchParams.get("history") !== "0";
-    sendJson(request, response, 200, publicState(serverState(server), {
+    sendJson(request, response, 200, publicState(state, {
       history: withHistory ? downsampleHistory(history) : undefined,
       historyStats: summarizeHistory(history, minutes),
       pollIntervals: { nodeMs: config.nodeIntervalMs, apiMs: config.apiIntervalMs },
+      version: VERSION,
+      rackSeenAt,
     }));
     return;
   }
@@ -362,21 +394,20 @@ async function handle(request, response) {
       sendJson(request, response, 400, { error: "month must use YYYY-MM format" });
       return;
     }
-    const server = serverById(url.searchParams.get("server"));
-    if (!server.usageStore) {
-      sendJson(request, response, 503, { error: server.usageOpenError });
+    if (!usageStore) {
+      sendJson(request, response, 503, { error: usageOpenError });
       return;
     }
     try {
-      sendJson(request, response, 200, server.usageStore.month(month));
+      sendJson(request, response, 200, usageStore.month(month));
     } catch (error) {
       sendJson(request, response, 500, { error: error.message });
     }
     return;
   }
   // The rack panel (public/rack/) for a bar display or kiosk.
-  if (url.pathname === "/rack") {
-    response.writeHead(302, { Location: `/rack/${url.search}` }).end();
+  if (url.pathname === "/rack" || url.pathname === "/mini") {
+    response.writeHead(302, { Location: `${url.pathname}/${url.search}` }).end();
     return;
   }
   await serveStatic(url.pathname, response);
@@ -399,7 +430,7 @@ inferenceTimer.unref();
 
 server.on("error", (error) => {
   console.error(`Spark Scope cannot listen on ${config.host}:${config.port}: ${error.message}`);
-  for (const server of servers) server.usageStore?.close();
+  usageStore?.close();
   process.exit(1);
 });
 
@@ -410,11 +441,10 @@ server.listen(config.port, config.host, () => {
     console.log("Warning: listening beyond localhost. Spark Scope has no authentication; expose it only on a network you trust.");
     console.log(`Accepted host names: localhost, IP addresses, ${hosts.short}, ${hosts.short}.local, ${hosts.short}.<tailnet>.ts.net${config.allowedHosts ? `, ${config.allowedHosts}` : ""} (SPARK_SCOPE_ALLOWED_HOSTS adds more).`);
   }
-  for (const server of servers) {
-    const label = server.definition.implicit ? "" : ` (${server.definition.name}: ${server.definition.nodes.join(", ")})`;
-    console.log(`Inference API${label}: ${server.definition.api}`);
-    console.log(server.usageStore ? `Token ledger: ${usageDbPath(server.definition)} (days in ${server.usageStore.timeZone})` : server.usageOpenError);
-  }
+  console.log(servers.length === 1 && servers[0].implicit
+    ? `Inference API: ${servers[0].api}`
+    : `Model servers: ${servers.map((server) => `${server.id}=${server.api} (${server.nodes.join(", ")})`).join("; ")}`);
+  console.log(usageStore ? `Token ledger: ${config.usageDbPath} (days in ${usageStore.timeZone})` : usageOpenError);
   console.log(`Topology: ${topology.source} (${topology.nodes.map((node) => `${node.name}=${!node.collect ? "not collected" : node.local ? "local" : `ssh ${node.host}`}`).join(", ")})`);
 });
 
@@ -422,7 +452,7 @@ function shutdown() {
   clearInterval(nodeTimer);
   clearInterval(inferenceTimer);
   server.close(() => {
-    for (const modelServer of servers) modelServer.usageStore?.close();
+    usageStore?.close();
     process.exit(0);
   });
   setTimeout(() => process.exit(1), 3000).unref();

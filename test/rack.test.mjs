@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { nodeView, clusterView, timePaths, compact, freeLabel, orderedNodes, nodeLinks, linkReason, reasonText, seriesPoints, panelWidth, bayLayout, valueRange, tempRangeLabel, clockTime, f1 } from "../public/rack/rack-view.js";
+import { nodeView, clusterView, timePaths, compact, freeLabel, orderedNodes, bayNodes, nodeLinks, linkReason, reasonText, seriesPoints, panelWidth, bayLayout, valueRange, tempRangeLabel, clockTime, f1 } from "../public/rack/rack-view.js";
 import { compact as webCompact } from "../public/view-data.js";
 import { loadTopology, publicTopology } from "../lib/topology.mjs";
 
@@ -19,7 +19,7 @@ const clock = { timeZone: "UTC", locale: "en-GB" };
 const healthy = (overrides = {}) => ({
   ok: true, collected: true, host: "spark-3", role: "WORKER", systemState: "running", failedUnits: 0,
   inferenceProcessUp: true, inferenceProcessReady: true,
-  gpu: { utilization: 93, temperature: 56, powerWatts: 26.4, thermalSlowdown: false },
+  gpu: { utilization: 93, temperature: 56, powerWatts: 26.4, thermalSlowdown: false, memory: { kind: "unified", totalBytes: 121.6 * GIB, availableBytes: 7.7 * GIB, usedBytes: 113.9 * GIB } },
   thermals: { tsocCelsius: 57.9 },
   memory: { totalBytes: 121.6 * GIB, availableBytes: 7.7 * GIB },
   disk: { usedPercent: 86, availableBytes: 127 * GIB },
@@ -41,6 +41,7 @@ test("bays follow the topology order and show display names, not SSH targets", (
   assert.equal(nodeView(META["1"], undefined).role, "Head");
   // A payload without topology still renders its nodes.
   assert.deepEqual(orderedNodes({ nodes: { a: { host: "box-a" } } }).map((meta) => meta.name), ["box-a"]);
+  assert.deepEqual(bayNodes({ topology: { nodes: [...TOPOLOGY.nodes, { id: "5" }, { id: "6" }] } }).map((meta) => meta.id), TOPOLOGY.nodes.map((meta) => meta.id));
 });
 
 test("in a ring each bay's link dots show the previous neighbour first, then the next", () => {
@@ -116,18 +117,54 @@ test("a node that is not collected shows 'not collected' instead of a fault or i
   assert.deepEqual(nodeView(META["3"], undefined).reasons, ["waiting for data"]);
 });
 
+test("the low-memory reason uses the panel's memory unit, like the meter", () => {
+  const low = healthy({ gpu: { ...healthy().gpu, memory: { kind: "unified", totalBytes: 121.6 * GIB, availableBytes: 1.5 * GIB, usedBytes: 120.1 * GIB } }, memory: { totalBytes: 121.6 * GIB, availableBytes: 1.5 * GIB } });
+  assert.equal(reasonText(nodeView(META["3"], low)), "1.5 GiB memory free");
+  assert.equal(reasonText(nodeView(META["3"], low, { mem: "gb" })), "1.6 GB memory free");
+});
+
 test("a healthy node reads OK with usage-based memory and disk figures", () => {
   const view = nodeView(META["3"], healthy());
   assert.equal(view.level, "good");
   assert.deepEqual(view.reasons, ["OK"]);
   assert.equal(view.memUsedPct, 94);
+  assert.equal(view.memWording, "unified");
+  const discrete = healthy({ gpu: { ...healthy().gpu, memory: { kind: "discrete", totalBytes: 32 * GIB, availableBytes: 1.5 * GIB, usedBytes: 30.5 * GIB } }, memory: { totalBytes: 64 * GIB, availableBytes: 40 * GIB } });
+  const card = nodeView(META["3"], discrete);
+  assert.equal(card.memWording, "gpu");
+  assert.equal(card.memFreeGiB, 1.5);
+  assert.equal(card.memUsedPct, 95);
+  assert.equal(reasonText(card), "1.5 GiB GPU memory free");
+  const unknown = nodeView(META["3"], healthy({ gpu: { ...healthy().gpu, memory: { kind: null, totalBytes: null, availableBytes: null, usedBytes: null } } }));
+  assert.equal(unknown.memWording, "gpu");
+  assert.equal(unknown.memFreeGiB, null);
+  assert.equal(unknown.memUsedPct, null);
+  assert.deepEqual(unknown.reasons, ["OK"]);
   assert.equal(Math.round(view.diskFreeGiB), 127);
   assert.equal(view.diskWarn, false);
+  const mac = healthy({ platform: "darwin", thermalPressure: 0, power: { systemWatts: 4.198 }, memory: { pressureLevel: 1 }, gpu: { ...healthy().gpu, temperature: null, powerWatts: null } });
+  const macView = nodeView(META["3"], mac);
+  assert.equal(macView.hasTemperature, false);
+  assert.equal(macView.systemPower, 4.198);
+  assert.equal(macView.power, null);
+  assert.equal(macView.thermalState, "Normal");
+  assert.equal(macView.memWarn, false);
+  const missingMac = nodeView(META["3"], { ...mac, gpu: { ...mac.gpu, available: false, status: "missing" } });
+  assert.equal(missingMac.level, "warn");
+  assert.equal(missingMac.reasons[0], "no GPU data");
+  assert.equal(nodeView(META["3"], { ...mac, memory: { pressureLevel: 4 } }).reasons[0], "Memory pressure");
+  assert.equal(nodeView(META["3"], { ...mac, gpu: { ...mac.gpu, thermalSlowdown: true } }).level, "crit");
   assert.equal(freeLabel(3610), "3.5 TiB");
   assert.equal(freeLabel(319.3), "319 GiB");
   assert.equal(freeLabel(7.74), "7.7 GiB");
   assert.equal(freeLabel(999.6), "1.0 TiB");
   assert.equal(freeLabel(9.97), "10 GiB");
+  // "?mem=gb": decimal units, the same rounding rule.
+  assert.equal(freeLabel(3610, "gb"), "3.9 TB");
+  assert.equal(freeLabel(319.3, "gb"), "343 GB");
+  assert.equal(freeLabel(7.74, "gb"), "8.3 GB");
+  assert.equal(freeLabel(930.6, "gb"), "999 GB");
+  assert.equal(freeLabel(931, "gb"), "1.0 TB");
 });
 
 test("the bay header names the actual reasons, most severe first", () => {
@@ -136,7 +173,7 @@ test("the bay header names the actual reasons, most severe first", () => {
     kernelEvents: { total: 1, capped: false, lastAt: "2026-09-26T06:12:17.345Z" },
   }), { nowMs: Date.parse("2026-09-26T06:20:00Z"), clock });
   assert.equal(view.level, "warn");
-  assert.deepEqual(view.reasons, ["disk 97%", "kernel 1 (06:12)"]);
+  assert.deepEqual(view.reasons, ["disk 97%", "1 kernel error (06:12)"]);
   const hot = nodeView(META["1"], healthy({ gpu: { utilization: 99, temperature: 91, powerWatts: 30, thermalSlowdown: true }, disk: { usedPercent: 97, availableBytes: GIB } }), { links: nodeLinks(ringState({ "4-1": "down" }), "1") });
   assert.equal(hot.level, "crit");
   assert.deepEqual(hot.reasons.slice(0, 2), ["thermal slowdown", "Link 4–1 down"]);
@@ -149,7 +186,7 @@ test("past kernel warnings and restarts clear after ten minutes, ongoing conditi
     disk: { usedPercent: 97, availableBytes: 31 * GIB },
   });
   const soon = nodeView(META["2"], node, { nowMs: Date.parse("2026-09-26T06:19:00Z"), clock });
-  assert.deepEqual(soon.reasons, ["restarted ×2", "disk 97%", "kernel 1 (06:12)"]);
+  assert.deepEqual(soon.reasons, ["restarted ×2", "disk 97%", "1 kernel error (06:12)"]);
   const later = nodeView(META["2"], node, { nowMs: Date.parse("2026-09-26T06:30:00Z"), clock });
   assert.deepEqual(later.reasons, ["disk 97%"]);
   assert.equal(nodeView(META["2"], healthy({ kernelEvents: { total: 3, capped: false, lastAt: null } })).level, "good");
@@ -158,7 +195,7 @@ test("past kernel warnings and restarts clear after ten minutes, ongoing conditi
 test("an unreachable node is critical and never shows zeros for unknown values", () => {
   const view = nodeView(META["3"], { ok: false, collected: true, host: "spark-3", error: "timeout" }, { lastOkAt: "2026-09-26T06:44:00Z", clock });
   assert.equal(view.level, "crit");
-  assert.deepEqual(view.reasons, ["no response"]);
+  assert.deepEqual(view.reasons, ["not responding"]);
   assert.equal(view.lastOk, "06:44");
   assert.equal(view.temp, undefined);
 });
@@ -238,6 +275,8 @@ test("token totals use compact units, the same as the web page", () => {
   assert.equal(compact(155347), "155K");
   assert.equal(compact(1061000000), "1.06B");
   assert.equal(compact(null), "—");
+  assert.equal(clusterView({ status: "starting", usage: { reported: { requests: false }, today: { total: 100, requests: 0 } } }).todayRequests, null);
+  assert.equal(clusterView({ status: "starting", usage: { reported: { requests: true }, today: { total: 100, requests: 0 } } }).todayRequests, 0);
   for (const value of [1500, 999_950, 9_552_810, 42, 3.2e9]) assert.equal(compact(value), webCompact(value));
 });
 
@@ -304,9 +343,80 @@ test("temperature traces keep a sensible scale and caption, and odd inputs do no
   assert.deepEqual(valueRange([], 38, 64), [38, 64]);
   assert.equal(tempRangeLabel(points), "41–58°C");
   assert.equal(tempRangeLabel([{ value: 50.2 }, { value: 49.8 }]), "50°C");
+  assert.equal(tempRangeLabel(points, "f"), "106–136°F");
   assert.equal(tempRangeLabel([{ value: null }]), "no data");
   assert.equal(f1(null), "—");
   assert.equal(clockTime(null), "—");
   // An invalid time zone falls back to the viewer's own instead of throwing.
   assert.match(clockTime(Date.UTC(2026, 9, 2, 3, 4), { timeZone: "Not/AZone" }), /^\d\d:\d\d$/);
+});
+
+test("in Korean the bays and the band use the Korean table, and the server message follows its key", async () => {
+  const { setLanguage, t, STRINGS } = await import("../public/i18n.js");
+  setLanguage("ko");
+  try {
+    assert.equal(nodeView(META["1"], undefined).role, STRINGS.ko["role.head"]);
+    assert.deepEqual(nodeView(META["3"], healthy()).reasons, [STRINGS.ko["rack.reason.ok"]]);
+    const node = healthy({ systemState: "degraded", failedUnits: 2, disk: { usedPercent: 97, availableBytes: 31 * GIB } });
+    assert.deepEqual(nodeView(META["2"], node, { links: nodeLinks(ringState({ "2-3": "down" }), "2") }).reasons, [
+      t("rack.link.down", { label: "2–3" }), t("rack.reason.system", { state: STRINGS.ko["systemState.degraded"] }),
+      t("rack.reason.failedUnits", { count: 2 }), t("rack.reason.disk", { percent: 97 }),
+    ]);
+    assert.equal(linkReason(link("2-3", "up", { slow: true, a: { available: true, up: true }, b: { available: true, up: true } })), t("rack.link.slowNoSpeed", { label: "2–3" }));
+    assert.equal(tempRangeLabel([]), STRINGS.ko["rack.tempRange.noData"]);
+
+    const nodes = nodesAll((meta) => (meta.id === "3" ? { ok: false, collected: true } : { ok: true }));
+    const fault = {
+      ...ringState({ "2-3": "down", "3-4": "down" }),
+      status: "degraded", inferenceState: "unknown", message: "Node connection needs attention (3/4 reachable)",
+      messageKey: "status.nodeConnection", messageParams: { connected: 3, count: 4 }, nodes,
+      inference: { ok: false }, usage: { modelName: "example-model", today: { total: 1, requests: 1 } },
+    };
+    const view = clusterView(fault);
+    assert.equal(view.title, STRINGS.ko["rack.cluster.inferenceDown"]);
+    assert.deepEqual(view.lines, [
+      `example-model | ${STRINGS.ko["rack.cluster.apiNoResponse"]}`,
+      [t("rack.count.nodes", { up: 3, count: 4 }), t("rack.count.links", { up: 2, count: 4 }), t("rack.note.notResponding", { node: "spark-3" }), t("rack.note.linkDown", { label: "2–3" })].join(" | "),
+    ]);
+    // A degradation without a note shows the server's message in Korean; a key the table does not know keeps the English.
+    const thermal = { ...ringState(), status: "degraded", inferenceState: "serving", nodes: nodesAll(), inference: { ok: true, modelName: "example-model", runningRequests: 1, waitingRequests: 0 }, serving: { engine: "SGLang", parallel: 4, label: "SGLang | 4 nodes" } };
+    const hot = clusterView({ ...thermal, message: "GPU thermal slowdown detected", messageKey: "status.thermal", messageParams: {} });
+    assert.equal(hot.title, STRINGS.ko["rack.cluster.serving"]);
+    assert.equal(hot.lines[0], `example-model | SGLang | ${t("serving.nodes", { count: 4 })}`);
+    assert.ok(hot.lines[1].includes(STRINGS.ko["status.thermal"]));
+    assert.ok(clusterView({ ...thermal, message: "Something new", messageKey: "status.somethingNew" }).lines[1].includes("Something new"));
+    const offline = clusterView({ ...ringState(), status: "offline", message: "Cannot reach any node", messageKey: "status.cannotReachAny", messageParams: {}, nodes: nodesAll(() => ({ ok: false, collected: true })), inference: { ok: false } });
+    assert.equal(offline.lines[0], STRINGS.ko["status.cannotReachAny"]);
+    const lost = clusterView(fault, { fetchFailed: true });
+    assert.deepEqual(lost.lines, [t("rack.cluster.serverDown", { brand: "SPARK SCOPE" }), t("rack.cluster.lastUpdate", { time: STRINGS.ko["rack.cluster.never"] })]);
+  } finally {
+    setLanguage("en");
+  }
+  // In English the engine label is the same as the server's.
+  const serving = { engine: "SGLang", parallel: 4, label: "SGLang | 4 nodes" };
+  const state = { ...ringState(), status: "healthy", inferenceState: "serving", nodes: nodesAll(), inference: { ok: true, modelName: "example-model", runningRequests: 0, waitingRequests: 0 }, serving };
+  assert.equal(clusterView(state).lines[0], "example-model | SGLang | 4 nodes");
+  assert.equal(clusterView({ ...state, serving: { engine: "SGLang", parallel: 1, label: "SGLang" } }).lines[0], "example-model | SGLang");
+});
+
+test('with several model servers the band adds up their output and shows a chip each; ?server= follows one', async () => {
+  const { rackFocus, serverChips } = await import('../public/rack/rack-view.js');
+  const servers = [
+    { id: 'a', name: null, nodes: ['1', '2'], inference: { ok: true, modelName: 'big-model', outputTokensPerSecond: 40.04, runningRequests: 2, waitingRequests: 0 }, serving: { engine: 'vLLM', parallel: 2, label: 'vLLM | 2 nodes' }, inferenceState: 'serving' },
+    { id: 'b', name: 'Small', nodes: ['3', '4'], inference: { ok: false, error: 'fetch failed' }, serving: { engine: null }, inferenceState: 'stopped' },
+  ];
+  const state = { ...ringState(), status: 'healthy', inferenceState: 'serving', servers, inference: servers[0].inference, nodes: {}, usage: { today: { total: 10, requests: 1 } } };
+  const all = rackFocus(state);
+  assert.equal(all.inference.outputTokensPerSecond, 40.04);
+  const view = clusterView(all, { clock });
+  assert.deepEqual(view.chips, [{ name: 'big-model', level: 'good', value: '40.0', unit: 'tok/s' }, { name: 'Small', level: 'idle', value: 'idle' }]);
+  assert.equal(view.lines[0], '');
+  assert.deepEqual(serverChips([{ id: 'c', inference: { ok: false } }]), [{ name: 'c', level: 'crit', value: 'not responding' }]);
+  // ?server=b: the band follows that server alone, with its own model line and no chips.
+  const one = rackFocus(state, 'a');
+  assert.equal(one.focusServer, 'a');
+  assert.equal(clusterView(one, { clock }).chips, null);
+  // One server: the state is used as it is.
+  const single = { ...state, servers: [servers[0]] };
+  assert.equal(rackFocus(single), single);
 });

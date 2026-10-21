@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,9 +10,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // Starts the real server on a free port with a node that is never contacted and an inference URL that refuses
 // connections, so nothing leaves this machine.
-async function startServer(directory, extraEnv = {}) {
+async function startServer(directory, extraEnv = {}, layout = { nodes: [{ id: "1", name: "spark-1", host: "spark-1", collect: false }], links: [] }) {
   const topology = path.join(directory, "topology.json");
-  writeFileSync(topology, JSON.stringify({ nodes: [{ id: "1", name: "spark-1", host: "spark-1", collect: false }], links: [] }));
+  writeFileSync(topology, JSON.stringify(layout));
   const child = spawn(process.execPath, [path.join(ROOT, "server.mjs")], {
     env: {
       ...process.env,
@@ -54,6 +54,12 @@ test("the server serves the dashboard, the rack panel, the fonts and the JSON AP
     const rack = await fetch(`${base}/rack/`);
     assert.equal(rack.status, 200);
     assert.match(await rack.text(), /rack\.js/);
+    const mini = await fetch(`${base}/mini/`);
+    assert.equal(mini.status, 200);
+    assert.match(await mini.text(), /mini\.js/);
+    const miniRedirect = await fetch(`${base}/mini`, { redirect: "manual" });
+    assert.equal(miniRedirect.status, 302);
+    assert.equal(miniRedirect.headers.get("location"), "/mini/");
     const icon = await fetch(`${base}/favicon.ico`);
     assert.equal(icon.status, 200);
     assert.equal(icon.headers.get("content-type"), "image/x-icon");
@@ -70,7 +76,19 @@ test("the server serves the dashboard, the rack panel, the fonts and the JSON AP
     assert.equal(state.usage.timeZone, "UTC");
     assert.equal(state.historyStats.windowMinutes, 15);
     assert.deepEqual(state.pollIntervals, { nodeMs: 5000, apiMs: 2000 });
+    assert.equal(state.version, JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version);
     assert.ok(Array.isArray(state.history));
+    // A rack panel's poll is remembered by time only; ordinary polls do not count as one.
+    assert.equal(state.rackSeenAt, null);
+    const before = Date.now();
+    await fetch(`${base}/api/state?minutes=15&history=0&from=rack`);
+    const seen = (await (await fetch(`${base}/api/state?history=0`)).json()).rackSeenAt;
+    assert.ok(Date.parse(seen) >= before - 1000 && Date.parse(seen) <= Date.now(), seen);
+    // The status message comes with a key and parameters for the pages' other languages.
+    const { t } = await import("../public/i18n.js");
+    assert.match(state.messageKey, /^status\./);
+    assert.equal(typeof state.messageParams, "object");
+    assert.equal(t(state.messageKey, state.messageParams, "en"), state.message);
     const light = await (await fetch(`${base}/api/state?minutes=15&history=0`)).json();
     assert.equal(light.history, undefined);
     assert.equal(light.historyStats.windowMinutes, 15);
@@ -83,6 +101,39 @@ test("the server serves the dashboard, the rack panel, the fonts and the JSON AP
     assert.equal((await fetch(`${base}/api/usage?month=2026-09`)).status, 200);
     assert.notEqual((await fetch(`${base}/%2e%2e/server.mjs`)).status, 200);
     assert.equal((await fetch(`${base}/`, { method: "POST" })).status, 405);
+  } finally {
+    const exited = new Promise((resolve) => child.on("exit", resolve));
+    child.kill("SIGTERM");
+    await exited;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("/api/usage returns each day's models and the month's per-model totals next to the daily totals", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "spark-scope-server-usage-"));
+  const { UsageStore } = await import("../lib/usage-store.mjs");
+  const store = new UsageStore(path.join(directory, "usage.sqlite"), { timeZone: "UTC" });
+  const sample = (modelName, output, at) => store.record({
+    ok: true, modelName, processStartedAt: `start-${modelName}`, promptTokensTotal: output * 10, promptComputeTokensTotal: output * 4,
+    promptCacheTokensTotal: output * 6, generationTokensTotal: output, completedRequestsTotal: output / 10,
+  }, Date.parse(at));
+  sample("model-a", 0, "2026-09-01T08:00:00Z");
+  sample("model-a", 100, "2026-09-01T09:00:00Z");
+  sample("model-b", 50, "2026-09-02T09:00:00Z");
+  store.close();
+  const { child, base } = await startServer(directory);
+  try {
+    const month = await (await fetch(`${base}/api/usage?month=2026-09`)).json();
+    // The fields older pages read are unchanged.
+    assert.deepEqual(month.days.map((day) => [day.day, day.output, day.input, day.total]), [["2026-09-01", 100, 1000, 1100], ["2026-09-02", 50, 500, 550]]);
+    assert.deepEqual(month.totals, { input: 1500, compute: 600, cache: 900, output: 150, requests: 15, total: 1650 });
+    assert.equal(month.firstMonth, "2026-09");
+    // New: the models of each day and the month per model.
+    assert.deepEqual(month.days.map((day) => day.models.map((model) => model.modelName)), [["model-a"], ["model-b"]]);
+    assert.deepEqual(month.models.map((model) => [model.modelName, model.days, model.input, model.output, model.requests]), [["model-a", 1, 1000, 100, 10], ["model-b", 1, 500, 50, 5]]);
+    assert.equal(month.firstDay, "2026-09-01");
+    const empty = await (await fetch(`${base}/api/usage?month=2026-08`)).json();
+    assert.deepEqual([empty.days, empty.models, empty.totals.total], [[], [], 0]);
   } finally {
     const exited = new Promise((resolve) => child.on("exit", resolve));
     child.kill("SIGTERM");
@@ -140,6 +191,159 @@ async function rawRequest(base, lines) {
   });
 }
 
+// A stand-in vLLM server for one model; set(generated) changes its output counter.
+async function fakeVllm(model) {
+  const { createServer } = await import("node:http");
+  let generated = 1000;
+  const server = createServer((request, response) => {
+    if (request.url === "/metrics") {
+      response.end(`vllm:num_requests_running{model_name="${model}"} 1\nvllm:num_requests_waiting{model_name="${model}"} 0\nvllm:generation_tokens_total{model_name="${model}"} ${generated}\nvllm:prompt_tokens_total{model_name="${model}"} 5000\nvllm:prompt_tokens_by_source_total{source="local_compute"} 5000\nvllm:request_prefill_time_seconds_sum 5\nvllm:request_prefill_time_seconds_count 1\nprocess_start_time_seconds 1790000000\n`);
+    } else if (request.url === "/v1/models") {
+      response.end(JSON.stringify({ data: [{ id: model }] }));
+    } else {
+      response.end("ok");
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return { url: `http://127.0.0.1:${server.address().port}`, set: (value) => { generated = value; }, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+async function waitFor(base, check, label) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const state = await (await fetch(`${base}/api/state`)).json();
+    if (check(state)) return state;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+test("model servers listed in topology.json are each read, judged and booked, and their URLs stay on the server", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "spark-scope-server-servers-"));
+  const [a, b] = [await fakeVllm("big-model"), await fakeVllm("small-model")];
+  const layout = {
+    nodes: [{ id: "1", host: "spark-1", collect: false }, { id: "2", host: "spark-2", collect: false }],
+    links: [],
+    servers: [{ id: "a", api: a.url, nodes: ["1"] }, { id: "b", name: "Small", api: b.url, nodes: ["2"] }],
+  };
+  const { child, base, output } = await startServer(directory, { SPARK_SCOPE_API_INTERVAL_MS: "500" }, layout);
+  try {
+    const first = await waitFor(base, (state) => state.servers?.every((server) => server.inference?.ok), "both servers");
+    assert.deepEqual(first.servers.map((server) => [server.id, server.name, server.nodes, server.inference.modelName]), [["a", null, ["1"], "big-model"], ["b", "Small", ["2"], "small-model"]]);
+    // inference is the first server's, for pages and scripts written for one server.
+    assert.equal(first.inference.modelName, "big-model");
+    assert.deepEqual(first.topology.servers, [{ id: "a", name: null, nodes: ["1"] }, { id: "b", name: "Small", nodes: ["2"] }]);
+    assert.doesNotMatch(JSON.stringify(first), new RegExp(`${a.url}|${b.url}`));
+    assert.match(output(), /Model servers: a=http:\/\/127\.0\.0\.1:\d+ \(1\); b=http:\/\/127\.0\.0\.1:\d+ \(2\)/);
+    // A new ledger takes a baseline from each server; then both servers' output is booked.
+    a.set(1100);
+    b.set(1030);
+    const booked = await waitFor(base, (state) => state.usage?.today?.output === 130, "output from both servers");
+    assert.equal(booked.servers[1].inference.ok, true);
+    const history = (await (await fetch(`${base}/api/state?minutes=15`)).json()).history;
+    assert.ok(history.length > 0 && history.every((point) => point.servers && "a" in point.servers && "b" in point.servers));
+  } finally {
+    child.kill();
+    await Promise.all([a.close(), b.close()]);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("mixed oMLX and vLLM history excludes session means and multi-model polls still book usage", async () => {
+  const { createServer } = await import("node:http");
+  const directory = mkdtempSync(path.join(os.tmpdir(), "spark-scope-mixed-"));
+  const fixture = JSON.parse(readFileSync(path.join(ROOT, "test/fixtures/omlx-v0.7.0.json")));
+  let status = { ...fixture.cached, models_loaded: 2, loaded_models: ["example-model", "another-model"] };
+  const omlx = createServer((request, response) => {
+    if (request.url === "/health") response.end(JSON.stringify(fixture.health));
+    else if (request.url === "/api/status") response.end(JSON.stringify(status));
+    else response.writeHead(404).end("{}");
+  });
+  await new Promise(resolve => omlx.listen(0, "127.0.0.1", resolve));
+  const vllm = await fakeVllm("live-model"), engineUrl = `http://127.0.0.1:${omlx.address().port}`;
+  const layout = { nodes: [{ id: "1", host: "local", collect: false }, { id: "2", host: "local", collect: false }], links: [], servers: [
+    { id: "a", api: engineUrl, apiKeyEnv: "VERIFY_MISSING_ENGINE_KEY", nodes: ["1"] }, { id: "b", api: vllm.url, nodes: ["2"] },
+  ] };
+  const { child, base, output } = await startServer(directory, { SPARK_SCOPE_API_INTERVAL_MS: "500", VERIFY_MISSING_ENGINE_KEY: "" }, layout);
+  try {
+    const first = await waitFor(base, state => state.servers.every(server => server.inference?.ok) && state.history.length > 2, "mixed history");
+    assert.equal(first.inference.averagePromptTokensPerSecond, 2247);
+    assert.equal(first.inference.modelName, null);
+    assert.equal(first.inference.promptTokensPerSecond, null);
+    assert.ok(first.history.every(point => point.servers.a.promptTokensPerSecond === null));
+    assert.ok(first.history.filter(point => point.servers.b.promptTokensPerSecond !== null).every(point => point.promptTokensPerSecond === 1000));
+    assert.doesNotMatch(JSON.stringify(first), /ledgerModelName|VERIFY_MISSING_ENGINE_KEY/);
+    assert.match(output(), /Server a: its apiKeyEnv variable is empty or unset/);
+    assert.doesNotMatch(output(), /VERIFY_MISSING_ENGINE_KEY/);
+    status = { ...status, total_prompt_tokens: status.total_prompt_tokens + 1000, total_completion_tokens: status.total_completion_tokens + 50, total_requests: status.total_requests + 1 };
+    const booked = await waitFor(base, state => state.usage.today.input === 1000, "multi-model usage");
+    assert.equal(booked.usage.today.requests, 1);
+    assert.equal(booked.usage.modelName, "example-model");
+  } finally {
+    child.kill();
+    await Promise.all([vllm.close(), new Promise(resolve => omlx.close(resolve))]);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a credential mistakenly pasted into apiKeyEnv is never echoed in startup output", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "spark-scope-key-warning-"));
+  const credentialLikeName = "fixtureSecretValue123";
+  const layout = { nodes: [{ id: "1", host: "local", collect: false }], links: [], servers: [{ id: "a", api: "http://127.0.0.1:9", apiKeyEnv: credentialLikeName, nodes: ["1"] }] };
+  const { child, output } = await startServer(directory, { [credentialLikeName]: "" }, layout);
+  try {
+    assert.match(output(), /Server a: its apiKeyEnv variable is empty or unset/);
+    assert.equal(output().includes(credentialLikeName), false);
+  } finally { child.kill(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("a model server that never answers does not slow down the others", async () => {
+  const { createServer: createTcpServer } = await import("node:net");
+  const directory = mkdtempSync(path.join(os.tmpdir(), "spark-scope-server-slow-"));
+  const a = await fakeVllm("big-model");
+  // Accepts connections and never answers, like a host whose API hangs: each request waits for the 4 s timeout.
+  const sockets = new Set();
+  const silent = createTcpServer((socket) => sockets.add(socket));
+  await new Promise((resolve) => silent.listen(0, "127.0.0.1", resolve));
+  const layout = {
+    nodes: [{ id: "1", host: "spark-1", collect: false }, { id: "2", host: "spark-2", collect: false }],
+    links: [],
+    servers: [{ id: "a", api: a.url, nodes: ["1"] }, { id: "b", api: `http://127.0.0.1:${silent.address().port}`, nodes: ["2"] }],
+  };
+  const { child, base } = await startServer(directory, { SPARK_SCOPE_API_INTERVAL_MS: "500" }, layout);
+  try {
+    const seen = new Set();
+    const until = Date.now() + 3000;
+    while (Date.now() < until) {
+      const state = await (await fetch(`${base}/api/state?history=0`)).json();
+      if (state.servers[0].inference?.ok) seen.add(state.servers[0].inference.updatedAt);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    // Every 500 ms over 3 s: about six readings of server a, not one per 4 s timeout of server b.
+    assert.ok(seen.size >= 4, `server a was read ${seen.size} times in 3 s`);
+  } finally {
+    child.kill();
+    for (const socket of sockets) socket.destroy();
+    await Promise.all([a.close(), new Promise((resolve) => silent.close(resolve))]);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an inference URL with a password, or without a scheme, stops the server with a message that does not repeat it", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "spark-scope-server-url-"));
+  try {
+    for (const url of ["http://admin:s3cret@127.0.0.1:9", "127.0.0.1:8000"]) {
+      await assert.rejects(startServer(directory, { SPARK_SCOPE_API_URL: url }), (error) => {
+        assert.match(error.message, /exited with 1/);
+        assert.match(error.message, /SPARK_SCOPE_API_URL must be an http:\/\/ or https:\/\/ URL/);
+        assert.doesNotMatch(error.message, /s3cret|127\.0\.0\.1:8000\/health/);
+        return true;
+      });
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("requests for another site's host name are refused, every response carries the security headers, and a malformed target is a 400", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "spark-scope-server-host-"));
   const { child, base } = await startServer(directory, { SPARK_SCOPE_ALLOWED_HOSTS: "dash.example.org" });
@@ -171,6 +375,69 @@ test("requests for another site's host name are refused, every response carries 
     assert.equal((await rawRequest(base, ["GET /%E0%A4%A HTTP/1.1", "Host: localhost", "Connection: close"])).status, 400);
   } finally {
     const exited = new Promise((resolve) => child.on("exit", resolve));
+    child.kill("SIGTERM");
+    await exited;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("node memory kinds survive GPU failures independently and unified memory uses the current RAM reading", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "spark-scope-memory-kind-"));
+  writeFileSync(path.join(directory, "ssh"), `#!/bin/sh
+while IFS= read -r line; do :; done
+for arg in "$@"; do
+  case "$arg" in fixture-*) snapshot="$NODE_FIXTURE_DIR/$arg.txt" ;; esac
+done
+while IFS= read -r line; do
+  [ "$line" != "unreachable" ] || exit 255
+  echo "$line"
+done < "$snapshot"
+`);
+  chmodSync(path.join(directory, "ssh"), 0o755);
+  const sample = (id, gpu, status, available) => writeFileSync(path.join(directory, `fixture-${id}.txt`),
+    `hostname|test-node\ngpu|${gpu}\ngpu_status|${status}\nmemory|131072000,${available},0,0\n`);
+  sample("u", "0, 40, 10, 200, P8, Not Active, Not Active, [N/A], [N/A], NVIDIA GB10, Integrated GPU", "ok", 16000000);
+  sample("d", "0, 40, 10, 200, P8, Not Active, Not Active, 16384, 32768, NVIDIA Discrete, Workstation", "ok", 32000000);
+  sample("x", "", "error", 24000000);
+  for (const [id, battery] of [["m", "present"], ["n", "absent"]]) writeFileSync(path.join(directory, `fixture-${id}.txt`), `platform|darwin\nhostname|test-node\nbattery|${battery}\npower|4198,80,Yes\ngpu|0,,,,N/A,Not Active,Not Active,,,Apple M1\ngpu_status|ok\nmemory|33554432,16000000,0,0\n`);
+  const layout = { nodes: ["u", "d", "x", "m", "n"].map(id => ({ id, host: `fixture-${id}` })), links: [] };
+  const { child, base } = await startServer(directory, {
+    PATH: `${directory}:${process.env.PATH}`, NODE_FIXTURE_DIR: directory, SPARK_SCOPE_NODE_INTERVAL_MS: "1000",
+  }, layout);
+  try {
+    const first = await waitFor(base, state => state.nodes.u?.gpu?.memory?.kind === "unified" && state.nodes.d?.gpu?.memory?.kind === "discrete", "reported kinds");
+    assert.equal(first.nodes.x.gpu.memory.kind, null);
+    writeFileSync(path.join(directory, "fixture-m.txt"), "platform|darwin\nhostname|test-node\npower|,,\ngpu|0,,,,N/A,Not Active,Not Active,,,Apple M1\ngpu_status|ok\nmemory|33554432,16000000,0,0\n");
+    const gap = await waitFor(base, state => state.nodes.m?.power?.systemWatts === null && state.nodes.m?.ok, "missing battery line");
+    assert.equal(gap.nodes.m.power.hasBattery, true);
+    for (const id of ["m", "n"]) writeFileSync(path.join(directory, `fixture-${id}.txt`), "unreachable\n");
+    const failed = await waitFor(base, state => state.nodes.m?.ok === false && state.nodes.n?.ok === false, "unreachable Macs");
+    const { nodeReading, readingValue, hasNodeTemperature } = await import("../public/view-data.js");
+    const { DEFAULTS } = await import("../public/settings.js");
+    for (const id of ["m", "n"]) {
+      assert.equal(failed.nodes[id].platform, "darwin");
+      assert.equal(failed.nodes[id].power.hasBattery, id === "m");
+      assert.equal(hasNodeTemperature(failed.nodes[id]), false);
+      assert.equal(nodeReading("temp", failed.nodes[id]), "thermal");
+      assert.equal(nodeReading("power", failed.nodes[id]), id === "m" ? "systemPower" : "swap");
+      assert.equal(readingValue("power", failed.nodes[id], DEFAULTS).text, "unknown");
+      assert.equal(failed.nodes[id].power.systemWatts, null);
+    }
+    for (const [index, status] of ["timeout", "stuck", "error"].entries()) {
+      sample("u", "", status, 24000000 + index);
+      sample("d", "", status, 48000000 + index);
+      const next = await waitFor(base, state => state.nodes.u?.gpu?.status === status && state.nodes.d?.gpu?.status === status, status);
+      assert.equal(next.nodes.u.gpu.memory.kind, "unified");
+      assert.equal(next.nodes.u.gpu.memory.availableBytes, (24000000 + index) * 1024);
+      assert.equal(next.nodes.u.gpu.memory.totalBytes, next.nodes.u.memory.totalBytes);
+      assert.equal(next.nodes.d.gpu.memory.kind, "discrete");
+      assert.equal(next.nodes.d.gpu.memory.totalBytes, null);
+      assert.equal(next.nodes.d.gpu.memory.usedBytes, null);
+      assert.equal(next.nodes.d.gpu.memory.availableBytes, null);
+      assert.equal(next.nodes.x.gpu.memory.kind, null);
+    }
+  } finally {
+    const exited = new Promise(resolve => child.once("exit", resolve));
     child.kill("SIGTERM");
     await exited;
     rmSync(directory, { recursive: true, force: true });

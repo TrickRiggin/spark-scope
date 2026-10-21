@@ -1,7 +1,7 @@
 {
   "name": "spark-scope",
-  "version": "0.1.0",
-  "description": "Read-only dashboard and rack panel for NVIDIA DGX Spark-class nodes (DGX Spark, ASUS Ascent GX10, MSI EdgeXpert) and their vLLM or SGLang server",
+  "version": "0.1.4",
+  "description": "Read-only dashboard and rack panel for NVIDIA DGX Spark-class nodes, other NVIDIA GPU Linux machines and Apple Silicon Macs with vLLM, SGLang, TensorFold, llama.cpp, Strata or oMLX",
   "keywords": [
     "dgx-spark",
     "gb10",
@@ -26,7 +26,9 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test"
+    "demo": "node tools/demo.mjs",
+    "test": "node --test",
+    "check": "node tools/check.mjs"
   },
   "engines": {
     "node": ">=22.13"

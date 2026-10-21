@@ -1,11 +1,9 @@
 import {
-  orderedNodes, nodeLinks, nodeView, reasonText, clusterView, seriesPoints, timePaths, valueRange, tempRangeLabel, f1, compact, freeLabel, panelWidth, bayLayout,
+  bayNodes, nodeLinks, nodeView, reasonText, clusterView, seriesPoints, timePaths, valueRange, tempRangeLabel, f1, compact, freeLabel, panelWidth, bayLayout, BRAND, degrees, degreeUnit, bayColor, bayColorStyle, rackFocus,
 } from "./rack-view.js";
-
-// /rack/?server=<id> picks the model server the band follows; without it, the first one.
-const serverParam = (() => { const id = new URLSearchParams(location.search).get("server"); return id ? `&server=${encodeURIComponent(id)}` : ""; })();
-// With several model servers, only the picked server's nodes are expected to run its inference process.
-const inServer = (state, id) => !state?.server || Boolean((state.servers ?? []).find((server) => server.id === state.server)?.nodes.includes(id));
+import { modelServers, serverOfNode, serverName } from "../view-data.js";
+import { t, setLanguage, queryLanguage, translatePage } from "../i18n.js";
+import { settingsFromQuery, DEFAULTS } from "../settings.js";
 
 const POLL_MS = 2000;
 const TEMP_POLL_MS = 30_000;
@@ -19,6 +17,12 @@ const TRACE_W = 178;
 const TRACE_H = 150;
 // The panel is laid out at BW x 480 logical pixels and scaled to the window. "?width=" changes BW (default 1920).
 const BW = panelWidth(location.search);
+// "?lang=ko" shows the panel in Korean; the kiosk has no keyboard, so the address is the only setting. The same
+// address takes the web page's temp, mem, colors and motion settings (the settings dialog builds the kiosk URL).
+const options = settingsFromQuery(location.search)?.settings ?? DEFAULTS;
+setLanguage(queryLanguage(location.search));
+translatePage();
+document.getElementById("cl-line1").textContent = t("rack.cluster.waitingBrand", { brand: BRAND });
 const PANEL_H = 480;
 const BH = 130;
 const BAND_TOP = 18;
@@ -41,7 +45,12 @@ let lastReceivedAt = null;
 let polling = false;
 let tempHistory = [];
 let liveOut = [];
-let bandAnchor = { serverMs: 0, clientMs: 0 };
+// The band's right edge follows this browser's clock, set to the server's time. The server's updatedAt moves in uneven
+// steps (the engine poll and the node poll both set it), and drawing to it made the band jump back and forth.
+// updatedAt is never ahead of the server's clock, so the largest offset seen is the closest; a much smaller one means
+// a clock was set back.
+let clockOffsetMs = null;
+let bandAnchor = { serverMs: 0 };
 const lastOkAt = {};
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
 const onMotionChange = (listener) => (reduceMotion.addEventListener ? reduceMotion.addEventListener("change", listener) : reduceMotion.addListener?.(listener));
@@ -64,7 +73,7 @@ function tempTrace(id, toMs) {
   const { line, area } = timePaths(points, { fromMs: toMs - TEMP_WINDOW_MS, toMs, width: TRACE_W, height: TRACE_H, min, max, gapMs: TEMP_GAP_MS });
   return {
     svg: `<svg width="${TRACE_W}" height="${TRACE_H}" viewBox="0 0 ${TRACE_W} ${TRACE_H}" preserveAspectRatio="none" aria-hidden="true"><path d="${area}" fill="var(--trace-fill)"/><path d="${line}" fill="none" stroke="var(--trace)" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/></svg>`,
-    range: tempRangeLabel(points),
+    range: tempRangeLabel(points, options.temp),
   };
 }
 
@@ -73,7 +82,7 @@ function syncBays(metas) {
   const ids = metas.map((meta) => meta.id).join(",");
   if (bays.dataset.ids === ids) return;
   bays.dataset.ids = ids;
-  bays.dataset.count = metas.length <= 4 ? String(metas.length) : "many";
+  bays.dataset.count = String(metas.length);
   bays.dataset.layout = bayLayout(metas.length, BW);
   bays.style.setProperty("--bays", String(metas.length));
   bays.innerHTML = metas.map((meta) => `<div class="bay" data-node="${escapeHtml(meta.id)}"></div>`).join("");
@@ -82,57 +91,82 @@ function syncBays(metas) {
 // detail is the part of the label that may be cut short with an ellipsis in a very narrow bay.
 const meter = (label, value, pct, warn = false, detail = "") => `<div class="meter"><div><span>${label}${detail ? `<em> ${detail}</em>` : ""}</span><b>${value}</b></div><div class="bar"><i class="${warn ? "warn" : ""}" style="width:${pct === null ? 0 : Math.max(0, Math.min(100, pct))}%"></i></div></div>`;
 
-function renderBay(meta, toMs) {
+function renderBay(meta, toMs, index) {
   const links = nodeLinks(latest, meta.id);
-  const view = nodeView(meta, latest.nodes?.[meta.id], { inferenceOk: Boolean(latest?.inference?.ok) && inServer(latest, meta.id), lastOkAt: lastOkAt[meta.id], nowMs: toMs, links });
-  const target = view.local ? "local" : view.host ? `SSH ${view.host}` : "no host";
+  // A node needs an inference process only while its own server's API answers; with several servers the bay names it.
+  const servers = modelServers(latest), server = serverOfNode(servers, meta.id);
+  const view = nodeView(meta, latest.nodes?.[meta.id], { inferenceOk: Boolean(server?.inference?.ok), lastOkAt: lastOkAt[meta.id], nowMs: toMs, links, mem: options.mem });
+  if (servers.length > 1 && server) view.role = `${serverName(server)} | ${view.role}`;
+  const target = view.local ? t("node.target.local") : view.host ? `SSH ${view.host}` : t("node.target.noHost");
   const el = bays.querySelector(`[data-node="${CSS.escape(meta.id)}"]`);
   el.className = `bay ${view.level}`;
-  const head = `<span class="stripe"></span><header><div class="name">${escapeHtml(view.name)}<small>${escapeHtml(view.role)}</small></div><div class="reason" title="${escapeHtml(view.reasons.join(", "))}"><span class="lamp ${view.level}"></span><span>${escapeHtml(reasonText(view))}</span></div></header>`;
-  // Peer names next to the dots only while they are short; long ids leave just the coloured dots.
-  const named = view.links.every((link) => link.tag.length <= 6);
+  // With "?colors=", the bay's bars and temperature trace take the node's colour; the stripe keeps its state colour.
+  el.style.cssText = bayColorStyle(bayColor(options.colors, index));
+  const head = `<span class="stripe"></span><header><div class="name">${escapeHtml(view.name)} <small>${escapeHtml(view.role)}</small></div><div class="reason" title="${escapeHtml(view.reasons.join(", "))}"><span class="lamp ${view.level}"></span><span>${escapeHtml(reasonText(view))}</span></div></header>`;
+  // Peer names next to the dots only while the ids are short; long ids leave just the coloured dots.
+  const named = view.links.every((link) => link.peer.length <= 6);
   const dots = view.links.length
-    ? `<span class="lk${named ? "" : " dots"}">Links${view.links.map((link) => `<em><i class="${link.level}"></i>${escapeHtml(link.tag)}</em>`).join("")}</span>`
+    ? `<span class="lk${named ? "" : " dots"}"><span class="lk-label">${t("rack.bay.links")}</span>${view.links.map((link) => `<em><i class="${link.level}"></i>${escapeHtml(link.tag)}</em>`).join("")}</span>`
     : "";
   if (!view.ok) {
     const body = view.pending
-      ? `<div class="down"><b class="num">—</b><span>${view.waiting ? "Waiting for the first poll" : `Not collected | ${escapeHtml(target)}`}</span></div>`
-      : `<div class="down"><b class="num">—</b><span>${escapeHtml(target)} not responding${view.lastOk ? ` | last OK ${view.lastOk}` : ""}</span></div>`;
-    const note = view.pending ? "No readings yet" : "Readings unavailable";
+      ? `<div class="down"><b class="num">—</b><span>${view.waiting ? t("rack.bay.waitingFirstPoll") : escapeHtml(t("rack.bay.notCollected", { target }))}</span></div>`
+      : `<div class="down"><b class="num">—</b><span>${escapeHtml(t("rack.bay.notResponding", { target }))}${view.lastOk ? ` | ${t("rack.bay.lastOk", { time: view.lastOk })}` : ""}</span></div>`;
+    const note = t(view.pending ? "rack.bay.noReadingsYet" : "rack.bay.readingsUnavailable");
     el.innerHTML = `${head}${body}<div class="foot"><span>${note}</span>${dots}</div>`;
+    fitFoot(el);
     return;
   }
   const trace = tempTrace(meta.id, toMs);
   el.innerHTML = `${head}
-    <div class="main">
-      <div class="temp">${trace.svg}<b class="num halo">${view.temp === null ? "—" : Math.round(view.temp)}<sup>°C</sup></b></div>
+    <div class="main${view.hasTemperature ? "" : " no-temperature"}">
+      ${view.hasTemperature ? `<div class="temp">${trace.svg}<b class="num halo${view.temp !== null && Math.round(degrees(view.temp, options.temp)) >= 100 ? " triple" : ""}">${view.temp === null ? "—" : Math.round(degrees(view.temp, options.temp))}<sup>${degreeUnit(options.temp)}</sup></b></div>` : ""}
       <div class="meters">
-        ${meter("GPU load", `${view.load ?? "—"}%`, view.load)}
-        ${meter("RAM", `${view.memUsedPct ?? "—"}%`, view.memUsedPct, false, `(${freeLabel(view.memFreeGiB)} free)`)}
-        ${meter("Disk", `${view.diskPct ?? "—"}%`, view.diskPct, view.diskWarn, `(${freeLabel(view.diskFreeGiB)} free)`)}
+        ${meter(t("rack.meter.gpuLoad"), `${view.load ?? "—"}%`, view.load)}
+        ${meter(view.memKind === "discrete" ? "VRAM" : view.memKind === "unified" ? "RAM" : t("rack.meter.memory"), `${view.memUsedPct ?? "—"}%`, view.memUsedPct, view.memWarn, t("rack.meter.free", { free: freeLabel(view.memFreeGiB, options.mem) }))}
+        ${meter(t("rack.meter.disk"), `${view.diskPct ?? "—"}%`, view.diskPct, view.diskWarn, t("rack.meter.free", { free: freeLabel(view.diskFreeGiB, options.mem) }))}
       </div>
-      <div class="cap"><span class="cap-label">GPU temp </span>60 min: ${trace.range}</div>
+      <div class="cap${view.thermalWarn ? " warn" : ""}">${view.hasTemperature ? `<span class="cap-label">${t("rack.caption.gpuTemp")} </span>${t("rack.caption.range", { range: trace.range })}` : `${t("node.reading.thermal")} ${escapeHtml(view.thermalState)}`}</div>
     </div>
-    <div class="foot"><span>Power ${f1(view.power)} W</span>${view.tsoc === null ? "" : `<span class="tsoc">TSOC ${f1(view.tsoc)}°C</span>`}${dots}</div>`;
+    <div class="foot">${view.hasTemperature ? `<span>${t("rack.power", { watts: f1(view.power) })}</span>` : view.systemPower !== null ? `<span>${t("node.reading.systemPower")} ${f1(view.systemPower)} W</span>` : ""}${view.tsoc === null ? "" : `<span class="tsoc">TSOC ${f1(degrees(view.tsoc, options.temp))}${degreeUnit(options.temp)}</span>`}${dots}</div>`;
+  fitFoot(el);
 }
 
-// The band glides left between polls with one CSS transition per poll (composited), instead of a script that moves
-// it every frame. Each redraw puts it back at the start; with reduced motion or while disconnected it stays still.
+// The footer keeps its first reading (the power) whole: when the line does not fit, the link dots drop their peer
+// names, then the TSOC reading and the "Links" label go, and only then is the power cut short.
+function fitFoot(bay) {
+  const foot = bay.querySelector(".foot");
+  const steps = ["fit-dots", "fit-tsoc", "fit-label", "fit-first"];
+  foot.classList.remove(...steps);
+  for (const step of steps) {
+    if (foot.scrollWidth <= foot.clientWidth) return;
+    foot.classList.add(step);
+  }
+}
+
+// The band moves left between polls with one CSS transition per poll (composited), instead of a script that moves
+// it every frame. It covers about 13 px per poll, so it moves in steps of about one pixel: a smooth glide would make
+// Chromium and the compositor draw a new frame at the display rate all day for sub-pixel moves.
+// Each redraw puts it back at the start; with reduced motion or while disconnected it stays still.
+const BAND_SHIFT = (POLL_MS / BAND_WINDOW_MS) * BW;
 function glideBand() {
   bandSvg.style.transition = "none";
   bandSvg.style.transform = "translateX(0px)";
-  if (reduceMotion.matches || screen.classList.contains("stale")) return;
+  if (reduceMotion.matches || options.motion === "still" || screen.classList.contains("stale")) return;
   void bandSvg.getBoundingClientRect();
-  bandSvg.style.transition = `transform ${POLL_MS}ms linear`;
-  bandSvg.style.transform = `translateX(${(-(POLL_MS / BAND_WINDOW_MS) * BW).toFixed(2)}px)`;
+  bandSvg.style.transition = `transform ${POLL_MS}ms ${options.motion === "smooth" ? "linear" : `steps(${Math.max(1, Math.round(BAND_SHIFT))}, end)`}`;
+  bandSvg.style.transform = `translateX(${(-BAND_SHIFT).toFixed(2)}px)`;
 }
 
 function drawBand() {
   const toMs = bandAnchor.serverMs;
   const fromMs = toMs - BAND_WINDOW_MS;
   const merged = new Map();
-  // Earlier samples come from the 60-minute history (refreshed every 30 s); the 2-second polls add their own.
-  for (const point of seriesPoints(tempHistory, "outputTokensPerSecond", fromMs - BAND_GAP_MS, toMs)) merged.set(point.at, point);
+  // Earlier samples come from the 60-minute history (refreshed every 30 s), up to the first 2-second poll: the history
+  // holds 10-second averages, and mixing them with the polls' raw values drew dips and spikes that never happened.
+  const historyEnd = Math.min(toMs, (liveOut[0]?.at ?? Infinity) - 1);
+  const focus = latest?.focusServer, output = focus ? (point) => point.servers?.[focus]?.outputTokensPerSecond : "outputTokensPerSecond";
+  for (const point of seriesPoints(tempHistory, output, fromMs - BAND_GAP_MS, historyEnd)) merged.set(point.at, point);
   for (const point of liveOut) if (point.at >= fromMs - BAND_GAP_MS) merged.set(point.at, point);
   const points = [...merged.values()].sort((a, b) => a.at - b.at);
   const peak = Math.max(0, ...points.map((point) => point.value ?? 0));
@@ -155,18 +189,41 @@ function renderCluster(fetchFailed) {
   if (view.stale && !wasStale) glideBand();
   $("cl-lamp").className = `lamp ${view.level}`;
   $("cl-title").textContent = view.title;
-  $("cl-line1").textContent = view.lines[0] ?? "";
+  // With several servers the first line is a chip per server: its state lamp, its name and its output.
+  // Each chip keeps its lamp and figure; only the names get shorter when the chips do not fit.
+  $("cl-line1").classList.toggle("chips", Boolean(view.chips));
+  if (view.chips) {
+    const line = $("cl-line1");
+    line.innerHTML = view.chips.map((chip) => `<span class="chip"><span class="lamp ${chip.level}"></span><span class="chip-name">${escapeHtml(chip.name)}</span>${chip.value === undefined ? "" : `<b>${escapeHtml(chip.value)}${chip.unit ? `<span class="unit"> ${escapeHtml(chip.unit)}</span>` : ""}</b>`}</span>`).join("");
+    fitChips(line);
+    // Text is measured with the fonts at hand; a font that loads after this draw (wider than its fallback) refits.
+    document.fonts?.ready.then(() => fitChips(line));
+  } else $("cl-line1").textContent = view.lines[0] ?? "";
   $("cl-line2").textContent = view.lines[1] ?? "";
+  $("out-value").parentElement.hidden = !view.outShown;
+  $("band-svg").style.display = view.outShown ? "" : "none";
   $("out-value").textContent = f1(view.out);
+  $("out-coverage").textContent = view.outputCoverage;
   $("tok-total").textContent = compact(view.todayTotal);
-  $("tok-sub").textContent = view.todayRequests === null ? "Tokens today" : `Tokens today | ${view.todayRequests.toLocaleString("en-US")} requests`;
+  $("tok-sub").textContent = view.todayRequests === null ? t("rack.tokensToday") : t("rack.tokensTodayRequests", { count: view.todayRequests.toLocaleString("en-US") });
+}
+
+// Where even a lamp and a figure do not fit, the figures drop their unit, then the figures go and each chip keeps its
+// lamp and name (the big figure has the total; the band's job here is which server serves).
+function fitChips(line) {
+  line.classList.remove("tight", "tighter");
+  const cut = () => [...line.children].some((chip) => chip.scrollWidth > chip.clientWidth + 1);
+  if (cut()) line.classList.add("tight");
+  if (cut()) line.classList.add("tighter");
 }
 
 function renderBays() {
   const toMs = Date.parse(latest.updatedAt) || Date.now();
-  const metas = orderedNodes(latest);
+  const metas = bayNodes(latest);
   syncBays(metas);
-  for (const meta of metas) renderBay(meta, toMs);
+  metas.forEach((meta, index) => renderBay(meta, toMs, index));
+  // The footers were fitted with the fonts at hand; a font that loads after this draw refits them.
+  document.fonts?.ready.then(() => bays.querySelectorAll(".bay").forEach((bay) => { if (bay.querySelector(".foot")) fitFoot(bay); }));
 }
 
 function render() {
@@ -181,21 +238,27 @@ async function poll() {
   polling = true;
   let state = null;
   try {
-    state = await getJson(`/api/state?minutes=15&history=0${serverParam}`);
+    state = await getJson("/api/state?minutes=15&history=0&from=rack");
   } catch {
     renderCluster(true);
   }
   try {
     if (state) {
-      latest = state;
+      // The band follows every model server together, or the one named by "?server=".
+      latest = rackFocus(state, options.server);
       lastReceivedAt = new Date();
       for (const [id, node] of Object.entries(state.nodes ?? {})) if (node?.ok) lastOkAt[id] = node.updatedAt ?? state.updatedAt;
-      const at = Date.parse(state.inference?.updatedAt ?? state.updatedAt);
+      const live = latest.inference, at = Date.parse(live?.updatedAt ?? state.updatedAt);
       if (Number.isFinite(at) && at !== liveOut[liveOut.length - 1]?.at) {
-        liveOut.push({ at, value: state.inference?.ok && Number.isFinite(state.inference.outputTokensPerSecond) ? state.inference.outputTokensPerSecond : null });
+        liveOut.push({ at, value: live?.ok && Number.isFinite(live.outputTokensPerSecond) ? live.outputTokensPerSecond : null });
         liveOut = liveOut.filter((point) => point.at >= at - BAND_WINDOW_MS - BAND_GAP_MS);
       }
-      bandAnchor = { serverMs: Date.parse(state.updatedAt) || Date.now(), clientMs: performance.now() };
+      const serverMs = Date.parse(state.updatedAt);
+      if (Number.isFinite(serverMs)) {
+        const offset = serverMs - Date.now();
+        if (clockOffsetMs === null || offset > clockOffsetMs || offset < clockOffsetMs - 30_000) clockOffsetMs = offset;
+      }
+      bandAnchor = { serverMs: Date.now() + (clockOffsetMs ?? 0) };
       render();
     }
   } catch (error) {
@@ -209,7 +272,7 @@ async function poll() {
 // Every 30 s: the 60-minute history for the temperature traces and the band's earlier samples.
 async function pollTemps() {
   try {
-    const state = await getJson(`/api/state?minutes=60${serverParam}`);
+    const state = await getJson("/api/state?minutes=60&from=rack");
     tempHistory = state.history ?? [];
     if (latest) renderBays();
   } catch {

@@ -45,7 +45,7 @@ test('a single node has no links and is judged on the node and the API alone', (
   const nodes = { 1: { ...node('1'), network: {} } };
   const links = buildRingLinks(nodes, topology);
   assert.deepEqual(links, {});
-  assert.deepEqual(clusterStatus(nodes, { ok: true }, links, topology), { status: 'healthy', inferenceState: 'serving', message: 'Node and inference API healthy' });
+  assert.deepEqual(clusterStatus(nodes, { ok: true }, links, topology), { status: 'healthy', inferenceState: 'serving', message: 'Node and inference API healthy', messageKey: 'status.healthy', messageParams: { count: 1 } });
   // A machine without systemd reports no system state; that alone is not a fault.
   nodes['1'].systemState = null;
   assert.equal(clusterStatus(nodes, { ok: true }, links, topology).status, 'healthy');
@@ -221,7 +221,7 @@ test('a reachable node without GPU readings degrades the cluster instead of read
   const t = normalizeTopology(rawExample(1));
   const nodes = { 1: { ...node('1'), gpu: { thermalSlowdown: false, available: false, status: 'timeout' } } };
   assert.deepEqual(clusterStatus(nodes, { ok: true }, buildRingLinks(nodes, t), t), {
-    status: 'degraded', inferenceState: 'serving', message: 'GPU readings unavailable on spark-1',
+    status: 'degraded', inferenceState: 'serving', message: 'GPU readings unavailable on spark-1', messageKey: 'status.gpuUnavailable', messageParams: { nodes: ['spark-1'] },
   });
   // Older payloads without the flag are judged as before.
   const legacy = { 1: node('1') };
@@ -238,3 +238,102 @@ test('a plane neither end can see (a wrong interface name) reads unknown instead
   assert.equal(linkState(link, { a: { available: true, up: true }, b: { available: true, up: true } }), 'up');
   assert.equal(linkState({ planes: ['a'] }, { a: { available: true, up: true }, b: { available: false, up: null } }), 'up');
 });
+
+test('every status message carries a stable key whose English text is the message, and a Korean text', async () => {
+  const { STRINGS, t } = await import('../public/i18n.js');
+  const one = normalizeTopology(rawExample(1));
+  const single = (overrides = {}) => ({ 1: { ...node('1'), network: {}, ...overrides } });
+  const nodes = (change = () => {}) => { const n = fourNodes(); change(n); return n; };
+  const status = (n, inference, topology = ring()) => clusterStatus(n, inference, buildRingLinks(n, topology), topology);
+  const results = [
+    clusterStatus({}, null, {}, ring()),
+    status({ 1: { ok: false, collected: true, id: '1' } }, { ok: false }, one),
+    status(nodes((n) => { for (const id of Object.keys(n)) n[id] = { ok: false, collected: true, id }; }), { ok: false }),
+    status(nodes((n) => { n['3'] = { ok: false, collected: true, id: '3' }; }), { ok: true }),
+    status(nodes((n) => { for (const id of ['1', '2']) n[id].gpu = { available: false, status: 'timeout' }; }), { ok: true }),
+    status(nodes((n) => { n['2'].failedUnits = 1; }), { ok: true }),
+    status(nodes((n) => { n['2'].failedUnits = 3; }), { ok: true }),
+    status(nodes((n) => { n['2'].systemState = 'degraded'; }), { ok: true }),
+    status(nodes((n) => { n['2'] = node('2', { base: 10, p0: false }); }), { ok: true }),
+    status(nodes((n) => { n['4'].gpu = { thermalSlowdown: true }; }), { ok: true }),
+    status(single({ inferenceProcessUp: false, inferenceProcessReady: false }), { ok: false }, one),
+    status({ 1: node('1', { proc: false }), 2: node('2', { base: 10, proc: false }), 3: node('3', { base: 20, proc: false }), 4: node('4', { base: 30, proc: false }) }, { ok: false }),
+    status(nodes((n) => { n['4'].inferenceProcessReady = false; }), { ok: true }),
+    status(single(), { ok: true }, one),
+    status(nodes(), { ok: true }),
+    status(nodes((n) => { n['1'] = uncollected('1'); }), { ok: true }, ring({ collect1: false })),
+  ];
+  const keys = new Set(results.map((result) => result.messageKey));
+  assert.deepEqual([...keys].sort(), [
+    'status.cannotReachAny', 'status.cannotReachNode', 'status.failedServices', 'status.gpuUnavailable', 'status.healthy', 'status.healthyUncollected',
+    'status.idle', 'status.inferenceAttention', 'status.nodeConnection', 'status.qsfpLink', 'status.starting', 'status.systemState', 'status.thermal',
+  ]);
+  for (const result of results) {
+    assert.ok(Object.hasOwn(STRINGS.ko, result.messageKey), `${result.messageKey} has Korean text`);
+    assert.equal(t(result.messageKey, result.messageParams, 'en'), result.message, result.messageKey);
+    assert.ok(t(result.messageKey, result.messageParams, 'ko').length > 0);
+    // Parameters are plain JSON values, so /api/state carries them as they are.
+    assert.deepEqual(JSON.parse(JSON.stringify(result.messageParams)), result.messageParams);
+  }
+  assert.deepEqual(results[4].messageParams, { nodes: ['spark-1', 'spark-2'] });
+  assert.equal(results[5].message, '1 failed system service needs attention');
+  assert.equal(results[6].message, '3 failed system services need attention');
+  assert.equal(results[15].message, 'Nodes and inference API healthy (1 not collected)');
+});
+
+test('with several model servers each is judged on its own nodes: a stopped one is idle, one that does not answer needs attention', () => {
+  const topology = normalizeTopology({ ...rawExample(4), servers: [
+    { id: 'a', api: 'http://spark-1:8000', nodes: ['1', '2'] },
+    { id: 'b', name: 'Small', api: 'http://spark-3:8000', nodes: ['3', '4'] },
+  ] });
+  const api = (ok) => (ok ? { ok: true, engine: 'SGLang', modelName: 'big-model' } : { ok: false, error: 'fetch failed' });
+  const servers = (a, b) => [{ id: 'a', name: null, nodes: ['1', '2'], inference: api(a) }, { id: 'b', name: 'Small', nodes: ['3', '4'], inference: api(b) }];
+  const links = (nodes) => buildRingLinks(nodes, topology);
+  const both = fourNodes();
+  const healthy = clusterStatus(both, servers(true, true), links(both), topology);
+  assert.equal(healthy.status, 'healthy');
+  assert.equal(healthy.message, 'Nodes and 2 model servers healthy');
+  assert.equal(healthy.messageKey, 'status.healthyServers');
+  // Group b switched off (no processes, no API) while a serves: idle by choice, and its nodes are not "missing" a process.
+  const bOff = { ...fourNodes(), 3: node('3', { base: 20, proc: false }), 4: node('4', { base: 30, proc: false }) };
+  const idle = clusterStatus(bOff, servers(true, false), links(bOff), topology);
+  assert.equal(idle.status, 'healthy');
+  assert.equal(idle.inferenceState, 'serving');
+  assert.equal(idle.message, 'Nodes healthy, model server Small idle');
+  assert.deepEqual(idle.messageParams, { idle: ['Small'], count: 1 });
+  // Group b's processes run but its API does not answer.
+  const attention = clusterStatus(both, servers(true, false), links(both), topology);
+  assert.equal(attention.status, 'degraded');
+  assert.equal(attention.message, 'Model server Small needs attention');
+  // Without a configured name a server is called by its model, then by its id.
+  const aDown = clusterStatus(both, servers(false, true), links(both), topology);
+  assert.equal(aDown.message, 'Model server a needs attention');
+  // Every group stopped: the whole lab is idle, as with one server, and that is healthy.
+  const off = Object.fromEntries(['1', '2', '3', '4'].map((id, i) => [id, node(id, { base: i * 10, proc: false })]));
+  const stopped = clusterStatus(off, servers(false, false), links(off), topology);
+  assert.equal(stopped.inferenceState, 'stopped');
+  assert.equal(stopped.messageKey, 'status.idle');
+  assert.equal(stopped.status, 'healthy');
+});
+
+test('a box stuck in systemd "starting" with no failed unit is not a fault', () => {
+  const nodes = fourNodes();
+  nodes['2'].systemState = 'starting';
+  assert.equal(clusterStatus(nodes, { ok: true }, buildRingLinks(nodes, ring()), ring()).status, 'healthy');
+});
+
+test('a box serving a model the layout does not list turns the status amber', async () => {
+  const { t } = await import('../public/i18n.js');
+  const topology = normalizeTopology({ ...rawExample(4), servers: [{ id: 'a', api: 'http://spark-1:8000', nodes: ['1', '2', '3'] }] });
+  const nodes = fourNodes();
+  const links = buildRingLinks(nodes, topology);
+  const servers = [{ id: 'a', name: null, nodes: ['1', '2', '3'], inference: { ok: true, engine: 'SGLang', modelName: 'm' } }];
+  const status = clusterStatus(nodes, servers, links, topology);
+  assert.equal(status.status, 'degraded');
+  assert.equal(status.messageKey, 'status.unlisted');
+  assert.equal(status.message, 'spark-4 runs a model the layout does not list; update topology.json');
+  assert.equal(t(status.messageKey, status.messageParams, 'en'), status.message);
+  nodes['4'] = node('4', { base: 30, proc: false });
+  assert.equal(clusterStatus(nodes, servers, buildRingLinks(nodes, topology), topology).status, 'healthy');
+});
+

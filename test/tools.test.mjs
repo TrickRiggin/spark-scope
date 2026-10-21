@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { usageMonth, fixtureState } from "../tools/fixtures.mjs";
 import { validateMonth } from "../public/view-data.js";
 
@@ -9,5 +11,72 @@ test("the render fixtures always have a ledger row for today, on every day of a 
     const month = validateMonth(usageMonth("2026-10", now), "2026-10");
     assert.equal(month.days.at(-1).day, `2026-10-${String(day).padStart(2, "0")}`);
     assert.ok(fixtureState(2, "serving", now).usage.today.output > 0, `day ${day}`);
+  }
+});
+
+test("the demo serves the pages and moving made-up data without touching anything else", async () => {
+  const { demoServer, liveState } = await import("../tools/demo.mjs");
+  // A 20-second cycle: prefill, then decoding, then idle.
+  const base = Math.floor(Date.parse("2026-10-03T09:00:00Z") / 20_000) * 20_000;
+  const prefill = liveState(4, "serving", base + 1000), decode = liveState(4, "serving", base + 8000), idle = liveState(4, "serving", base + 17_000);
+  assert.equal(prefill.inference.outputTokensPerSecond, 0);
+  assert.equal(Date.parse(prefill.inference.prefillUpdatedAt), base + 1000);
+  assert.ok(decode.inference.outputTokensPerSecond > 50);
+  assert.ok(Date.parse(decode.inference.prefillUpdatedAt) < base + 8000);
+  assert.equal(idle.inference.runningRequests, 0);
+  for (let count = 1; count <= 8; count++) assert.equal(Object.keys(liveState(count, "fault", base).nodes).length, count);
+  assert.equal(fixtureState(8, "fault", base, { servers: 5 }).servers.length, 5);
+  const omlxMixed = fixtureState(2, "serving", base, { servers: 2, macNodes: 1, engine: "oMLX", mixedEngines: true });
+  assert.equal(omlxMixed.inference.promptTokensPerSecond, null);
+  assert.equal(omlxMixed.nodes["1"].inference.engine, "oMLX");
+  assert.ok(omlxMixed.history.every(point => point.servers.a.promptTokensPerSecond === null && point.promptTokensPerSecond === point.servers.b.promptTokensPerSecond));
+  const mixed = liveState(4, "serving", base + 8000, { gpuWorkstations: 1 });
+  assert.equal(Object.keys(mixed.nodes).length, 5);
+  assert.equal(mixed.nodes["5"].gpu.memory.kind, "discrete");
+  assert.equal(mixed.servers[0].serving.parallel, 4);
+  assert.equal(mixed.servers.at(-1).serving.parallel, 1);
+  const unified = fixtureState(1, "serving").nodes["1"];
+  assert.equal(unified.gpu.memory.kind, "unified");
+  assert.equal(unified.gpu.memory.availableBytes, unified.memory.availableBytes);
+  const fixture = fixtureState(1, "serving", Date.now(), { gpuWorkstations: 1 });
+  assert.equal(fixture.nodes["1"].gpu.memory.kind, "unified");
+  assert.equal(fixture.nodes["2"].gpu.memory.totalBytes, 32 * 1024 ** 3);
+  assert.notEqual(fixture.nodes["2"].gpu.memory.totalBytes, fixture.nodes["2"].memory.totalBytes);
+  assert.equal(fixture.history.at(-1).nodes["2"].memoryAvailableBytes, fixture.nodes["2"].gpu.memory.availableBytes);
+  assert.equal(fixture.nodes["2"].name, "gpu-2");
+  assert.equal(fixture.nodes["2"].host, "gpu-2");
+  assert.equal(fixture.topology.nodes.at(-1).hardware, "GPU workstation");
+  assert.deepEqual(mixed.topology.links, fixtureState(4, "serving").topology.links);
+  assert.equal(mixed.topology.nodes.length, 5);
+  assert.deepEqual(mixed.servers.at(-1).nodes, ["5"]);
+  const mac = fixtureState(2, "serving", base + 8000, { macNodes: 2 });
+  assert.equal(mac.nodes["1"].platform, "darwin");
+  assert.equal(mac.nodes["1"].gpu.temperature, null);
+  assert.equal(mac.nodes["1"].gpu.memory.kind, "unified");
+  assert.ok(mac.nodes["1"].gpu.memory.inUseBytes > 0);
+  assert.equal(mac.nodes["2"].power.systemWatts, null);
+  assert.equal(mac.history.at(-1).nodes["1"].temperature, null);
+  assert.equal(mac.history.at(-1).nodes["1"].memoryAvailableBytes, mac.nodes["1"].memory.availableBytes);
+  assert.equal(mac.topology.links.length, 0);
+  const tooMany = spawnSync(process.execPath, [fileURLToPath(new URL("../tools/demo.mjs", import.meta.url)), "--nodes", "8", "--discrete"], { encoding: "utf8", timeout: 2000 });
+  assert.equal(tooMany.status, 2);
+  assert.match(tooMany.stderr, /8 total nodes maximum/);
+
+  const server = demoServer(3, "serving");
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  try {
+    for (const page of ["/", "/rack/", "/mini/", "/app.js", "/mini/mini-view.js"]) assert.equal((await fetch(url + page)).status, 200, page);
+    assert.equal((await fetch(`${url}/mini`, { redirect: "manual" })).headers.get("location"), "/mini/");
+    assert.equal((await fetch(`${url}/../package.json`)).status, 404);
+    const state = await (await fetch(`${url}/api/state?minutes=15`)).json();
+    assert.equal(Object.keys(state.nodes).length, 3);
+    assert.ok(Array.isArray(state.history) && state.history.length > 0);
+    assert.equal(state.rackSeenAt, null);
+    await fetch(`${url}/api/state?history=0&from=rack`);
+    assert.ok((await (await fetch(`${url}/api/state?history=0`)).json()).rackSeenAt);
+    assert.equal((await (await fetch(`${url}/api/usage?month=2026-10`)).json()).month, "2026-10");
+  } finally {
+    server.close();
   }
 });

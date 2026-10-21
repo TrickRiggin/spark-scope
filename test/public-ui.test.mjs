@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { compact, duration, tokenRate, chartPath, eventTime, validateMonth, monthOptions, monthLabel, dayLabel, localDay, nodeOrder, linkText, fabricLayout, nodeLabel, labelWidth, nextTheme, COLORS } from '../public/view-data.js';
+import { readingValue, nodeColor, lowContrast, PALETTE, compact, duration, tokenRate, chartPath, clockTime, eventTime, memory, memoryUnit, temperature, temperatureUnit, validateMonth, monthOptions, monthLabel, dayLabel, localDay, nodeOrder, linkText, fabricLayout, nodeLabel, labelWidth, nextTheme, COLORS } from '../public/view-data.js';
 import { loadTopology, publicTopology } from '../lib/topology.mjs';
+import { rackQuery, DEFAULTS, SETTINGS_KEY, parseSettings, loadSettings, saveSettings, loadTheme, saveTheme, settingsQuery, settingsFromQuery, withoutSettingsQuery } from '../public/settings.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const example = (count) => publicTopology(loadTopology(path.join(ROOT, 'examples', `topology.${count}-node.json`), { fallback: false }));
@@ -117,6 +118,7 @@ test('one node, or nodes without links, draw no interconnect diagram', () => {
   assert.equal(fabricLayout(null), null);
   // A link to a node the topology does not list is skipped rather than drawn to nowhere.
   assert.equal(fabricLayout({ nodes: example(2).nodes, links: [{ id: 'x', nodes: ['1', '9'] }] }), null);
+  assert.deepEqual(fabricLayout({ ...example(4), nodes: [...example(4).nodes, { id: '5' }] }), fabricLayout(example(4)));
 });
 
 test('two cables between two nodes are drawn as two visibly separate lines', () => {
@@ -215,7 +217,7 @@ test("a poll without history adds its own sample to the history the page already
   const state = {
     updatedAt: '2026-10-02T03:00:02Z',
     inference: { ok: true, updatedAt: '2026-10-02T03:00:02Z', outputTokensPerSecond: 61.3, promptTokensPerSecond: 2104, runningRequests: 2, waitingRequests: 0 },
-    nodes: { 1: { ok: true, gpu: { temperature: 57 }, memory: { availableBytes: 9.5 * 2 ** 30 } }, 2: { ok: false } },
+    nodes: { 1: { ok: true, gpu: { temperature: 57, memory: { kind: 'unified', availableBytes: 9.5 * 2 ** 30 } }, memory: { availableBytes: 9.5 * 2 ** 30 } }, 2: { ok: false } },
   };
   const point = livePoint(state);
   assert.deepEqual(point, {
@@ -242,4 +244,314 @@ test("timeouts and media-query listeners also work where Safari lacks the newer 
   onMediaChange({ addListener: (fn) => calls.push(['legacy', fn]) }, () => {});
   onMediaChange({ addEventListener: (type, fn) => calls.push([type, fn]) }, () => {});
   assert.deepEqual(calls.map(([kind]) => kind), ['legacy', 'change']);
+});
+
+test('settings fall back to the default field by field when stored values are missing or invalid', () => {
+  assert.deepEqual(parseSettings(null), DEFAULTS);
+  assert.deepEqual(parseSettings('{"temp":"f"}'), DEFAULTS);
+  assert.deepEqual(parseSettings([1, 2]), DEFAULTS);
+  assert.deepEqual(parseSettings({ temp: 'f', mem: 'tb', clock: 12, range: 60, refresh: 3, pause: 'no', lang: 'fr', extra: 1 }),
+    { ...DEFAULTS, temp: 'f' });
+  assert.deepEqual(parseSettings({ temp: 'f', mem: 'gb', clock: '12', range: 360, refresh: 10, pause: false, lang: 'ko' }),
+    { ...DEFAULTS, temp: 'f', mem: 'gb', clock: '12', range: 360, refresh: 10, pause: false, lang: 'ko' });
+  // English is the default language.
+  assert.equal(DEFAULTS.lang, 'en');
+});
+
+test('settings storage keeps only changed fields and survives broken or missing storage', () => {
+  const memoryStore = () => { const data = new Map(); return { getItem: (k) => data.get(k) ?? null, setItem: (k, v) => data.set(k, String(v)), removeItem: (k) => data.delete(k), data }; };
+  const store = memoryStore();
+  assert.equal(saveSettings(store, { ...DEFAULTS, temp: 'f', range: 15, lang: 'ko' }), true);
+  assert.equal(store.data.get(SETTINGS_KEY), '{"temp":"f","range":15,"lang":"ko"}');
+  assert.deepEqual(loadSettings(store), { ...DEFAULTS, temp: 'f', range: 15, lang: 'ko' });
+  saveSettings(store, DEFAULTS);
+  assert.equal(store.data.has(SETTINGS_KEY), false);
+  store.setItem(SETTINGS_KEY, '{not json');
+  assert.deepEqual(loadSettings(store), DEFAULTS);
+  const throwing = { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); }, removeItem() { throw new Error('blocked'); } };
+  assert.deepEqual(loadSettings(throwing), DEFAULTS);
+  assert.equal(saveSettings(throwing, DEFAULTS), false);
+  assert.deepEqual(loadSettings(null), DEFAULTS);
+  assert.equal(loadTheme(throwing), null);
+  saveTheme(store, 'dark');
+  assert.equal(loadTheme(store), 'dark');
+  saveTheme(store, null);
+  assert.equal(loadTheme(store), null);
+});
+
+test('a settings link carries the whole setup and ignores what it does not know', () => {
+  const settings = { ...DEFAULTS, temp: 'f', mem: 'gb', clock: '12', range: 15, refresh: 5, pause: false, lang: 'ko' };
+  const query = settingsQuery(settings, 'dark');
+  assert.equal(query, 'temp=f&mem=gb&clock=12&range=15&refresh=5&pause=0&lang=ko&theme=dark');
+  assert.deepEqual(settingsFromQuery(`?${query}`), { settings, theme: 'dark' });
+  assert.equal(settingsQuery(DEFAULTS, null), '');
+  assert.equal(settingsFromQuery(''), null);
+  assert.equal(settingsFromQuery('?view=tokens'), null);
+  // A link names only what differs from the defaults, so a missing field resets to its default.
+  assert.deepEqual(settingsFromQuery('?temp=f&range=7&pause=maybe&theme=blue'), { settings: { ...DEFAULTS, temp: 'f' }, theme: null });
+  // A link with only the language switches only the language; an unknown language reads as English.
+  assert.deepEqual(settingsFromQuery('?lang=ko'), { settings: { ...DEFAULTS, lang: 'ko' }, theme: null });
+  assert.deepEqual(settingsFromQuery('?lang=fr'), { settings: DEFAULTS, theme: null });
+  assert.equal(settingsQuery({ ...DEFAULTS, lang: 'ko' }, null), 'lang=ko');
+  assert.equal(withoutSettingsQuery('?temp=f&mem=gb&view=tokens'), '?view=tokens');
+  assert.equal(withoutSettingsQuery('?lang=ko&view=tokens'), '?view=tokens');
+  assert.equal(withoutSettingsQuery('?temp=f&theme=dark'), '');
+});
+
+test('temperatures and memory read in the chosen units', () => {
+  assert.equal(temperature(63, 'c'), '63');
+  assert.equal(temperature(63, 'f'), '145');
+  assert.equal(temperature(47.5, 'f', 1), '117.5');
+  assert.equal(temperature(null, 'f'), 'unknown');
+  assert.equal(temperatureUnit('f'), '°F');
+  assert.equal(memory(122 * 2 ** 30, 'gib', 0), '122');
+  assert.equal(memory(122 * 2 ** 30, 'gb', 0), '131');
+  assert.equal(memory(10.5 * 2 ** 30, 'gb'), '11.3');
+  assert.equal(memoryUnit('gb'), 'GB');
+  assert.equal(memoryUnit('anything'), 'GiB');
+});
+
+test('the 12-hour clock names AM and PM and drops the leading zero', () => {
+  const at = new Date(2026, 9, 3, 18, 4, 5).getTime();
+  assert.equal(clockTime(at, { hour12: true }), '6:04:05 PM');
+  assert.equal(clockTime(at, { hour12: true, seconds: false }), '6:04 PM');
+  assert.match(clockTime(at), /^18.04.05$/);
+  assert.match(eventTime(at, at, { hour12: true }), /^6:04:05 PM$/);
+});
+
+test('node card settings: four distinct known readings, known bars and panels, whole-number warning levels', () => {
+  assert.deepEqual(DEFAULTS.readings, ['temp', 'power', 'mem', 'clock']);
+  assert.deepEqual(DEFAULTS.bars, ['unified']);
+  assert.deepEqual(DEFAULTS.hide, []);
+  assert.equal(DEFAULTS.labels, 'auto');
+  const good = { readings: ['temp', 'power', 'disk', 'clock'], bars: ['unified', 'disk'], hide: ['engine', 'trends'], labels: 'short', tempWarn: 80, diskWarn: 90, memWarn: 4 };
+  assert.deepEqual(parseSettings(good), { ...DEFAULTS, ...good });
+  // Three readings, a repeated one, an unknown one: the slots fall back to the default four.
+  for (const readings of [['temp', 'power', 'mem'], ['temp', 'temp', 'mem', 'clock'], ['temp', 'power', 'fan', 'clock'], 'temp,power,mem,clock'])
+    assert.deepEqual(parseSettings({ readings }).readings, DEFAULTS.readings, String(readings));
+  assert.deepEqual(parseSettings({ bars: [] }).bars, [], 'no bars at all is a valid choice');
+  assert.deepEqual(parseSettings({ bars: ['gpu'] }).bars, DEFAULTS.bars);
+  assert.deepEqual(parseSettings({ hide: ['ledger', 'ledger'] }).hide, DEFAULTS.hide);
+  for (const [key, value] of [['tempWarn', 39], ['tempWarn', 85.5], ['diskWarn', 101], ['memWarn', -1], ['memWarn', '2'], ['labels', 'tiny']])
+    assert.equal(parseSettings({ [key]: value })[key], DEFAULTS[key], `${key}=${value}`);
+  // A stored list is a copy: changing the parsed settings never changes the defaults.
+  const parsed = parseSettings(null);
+  parsed.readings[0] = 'cpu';
+  assert.equal(DEFAULTS.readings[0], 'temp');
+  // In a link the lists are comma-separated.
+  const query = settingsQuery({ ...DEFAULTS, temp: 'f', readings: ['temp', 'power', 'disk', 'clock'], bars: ['unified', 'disk'], hide: ['engine'] }, null);
+  assert.equal(query, 'temp=f&readings=temp,power,disk,clock&bars=unified,disk&hide=engine');
+  assert.deepEqual(settingsFromQuery(`?${query}`).settings, { ...DEFAULTS, temp: 'f', readings: ['temp', 'power', 'disk', 'clock'], bars: ['unified', 'disk'], hide: ['engine'] });
+  assert.deepEqual(settingsFromQuery('?bars=').settings.bars, []);
+  assert.deepEqual(settingsFromQuery('?readings=temp,power').settings.readings, DEFAULTS.readings);
+});
+
+test('card readings give text, unit and warning in the chosen units', async () => {
+  const GIB = 2 ** 30;
+  const settings = { ...DEFAULTS, temp: 'f' };
+  const node = { ok: true, gpu: { temperature: 86, powerWatts: 31.52, clockMHz: 2405, memory: { kind: 'unified', totalBytes: 128 * GIB, availableBytes: 1.5 * GIB, usedBytes: 126.5 * GIB } }, memory: { availableBytes: 1.5 * GIB },
+    disk: { totalBytes: 1000 * GIB, availableBytes: 40 * GIB, usedPercent: 96 }, cpu: { load1: 1.834, cores: 20 }, nvmeCelsius: 48, processMemoryBytes: 98.2 * GIB };
+  const read = (id) => readingValue(id, node, settings);
+  assert.deepEqual(read('temp'), { text: '187', unit: '°F', warn: true });
+  assert.deepEqual(read('power'), { text: '31.5', unit: 'W', warn: false });
+  assert.deepEqual(read('mem'), { text: '1.5', unit: 'GiB', warn: true });
+  assert.deepEqual(read('disk'), { text: '960', unit: 'GiB', warn: true });
+  assert.deepEqual(read('diskfree'), { text: '40', unit: 'GiB', warn: true });
+  assert.deepEqual(read('cpu'), { text: '1.83', unit: '/ 20', warn: false });
+  assert.deepEqual(read('nvme'), { text: '118', unit: '°F', warn: false });
+  assert.equal(read('nic').text, 'unknown');
+  assert.equal(readingValue('temp', { ok: false }, settings).text, 'unknown');
+  assert.equal(readingValue('temp', node, { ...settings, tempWarn: 90 }).warn, false);
+  assert.equal(readingValue('mem', node, { ...settings, mem: 'gb' }).unit, 'GB');
+  const { gpuMemory, memoryWording, readingLabel, livePoint } = await import('../public/view-data.js');
+  const discrete = { ...node, gpu: { ...node.gpu, memory: { kind: 'discrete', totalBytes: 32 * GIB, availableBytes: 12 * GIB, usedBytes: 20 * GIB } }, memory: { availableBytes: 40 * GIB } };
+  const unknown = { ...discrete, gpu: { ...node.gpu, memory: { kind: null, totalBytes: null, usedBytes: null, availableBytes: null } } };
+  for (const [sample, wording, text, free] of [[node, 'unified', '1.5', 1.5 * GIB], [discrete, 'gpu', '12.0', 12 * GIB], [unknown, 'gpu', 'unknown', null]]) {
+    assert.equal(memoryWording([gpuMemory(sample).kind]), wording);
+    assert.equal(readingLabel('mem', { wording }), wording === 'unified' ? 'node.reading.mem' : 'node.reading.gpuMem');
+    assert.equal(readingValue('mem', sample, settings).text, text);
+    assert.equal(livePoint({ updatedAt: '2026-10-02T03:00:02Z', nodes: { 1: sample } }).nodes[1].memoryAvailableBytes, free);
+  }
+  assert.equal(gpuMemory({ ...discrete, ok: false }).availableBytes, null);
+  assert.equal(readingValue('mem', { ...discrete, gpu: {} }, settings).text, 'unknown');
+  assert.equal(readingValue('mem', unknown, settings).unit, '');
+  assert.equal(memoryWording(['unified', 'discrete']), 'gpu');
+  const { nodeReading, hasNodeTemperature, memoryWarning, gpuPowerWatts } = await import('../public/view-data.js');
+  const mac = { ...node, platform: 'darwin', thermalPressure: 0, memory: { ...node.memory, pressureLevel: 1 }, power: { hasBattery: true, systemWatts: 4.198 }, gpu: { ...node.gpu, temperature: null, powerWatts: null, clockMHz: null, memory: { ...node.gpu.memory, inUseBytes: 1.062 * GIB } } };
+  assert.equal(nodeReading('temp', mac), 'thermal');
+  assert.equal(nodeReading('clock', mac), 'gpuInUse');
+  assert.equal(nodeReading('power', mac), 'systemPower');
+  assert.equal(nodeReading('nvme', mac), 'swap');
+  assert.equal(nodeReading('nic', mac), 'compressed');
+  assert.equal(nodeReading('power', { ...mac, power: { hasBattery: true, systemWatts: null } }), 'systemPower');
+  assert.equal(nodeReading('power', { ...mac, power: { hasBattery: false } }), 'swap');
+  assert.equal(nodeReading('power', { ...mac, power: {} }), 'systemPower');
+  assert.equal(readingValue('nvme', { ...mac, memory: { swapUsedBytes: GIB } }, settings).text, '1.0');
+  assert.equal(readingValue('nic', { ...mac, memory: { compressedBytes: GIB } }, settings).text, '1.0');
+  assert.equal(hasNodeTemperature(mac), false);
+  assert.equal(hasNodeTemperature(node), true);
+  assert.deepEqual(readingValue('temp', mac, settings), { text: 'Normal', unit: '', warn: false });
+  assert.deepEqual(readingValue('power', mac, settings), { text: '4.2', unit: 'W', warn: false });
+  assert.deepEqual(readingValue('clock', mac, settings), { text: '1.1', unit: 'GiB', warn: false });
+  assert.equal(readingValue('temp', { ...mac, thermalPressure: 2 }, settings).warn, true);
+  assert.equal(memoryWarning(mac), false);
+  for (const pressureLevel of [2, 4]) assert.equal(memoryWarning({ ...mac, memory: { availableBytes: 16 * GIB, pressureLevel } }), true);
+  assert.equal(memoryWarning({ ...mac, memory: {} }), false);
+  assert.equal(gpuPowerWatts([mac, { ok: false, gpu: { powerWatts: 30 } }]), null);
+  assert.equal(gpuPowerWatts([{ ok: true, gpu: { powerWatts: 0 } }]), 0);
+  assert.equal(gpuPowerWatts([mac, node]), node.gpu.powerWatts);
+});
+
+test('node colours: palette names or hex by position, written without # in a link', () => {
+  assert.deepEqual(DEFAULTS.colors, []);
+  assert.deepEqual(parseSettings({ colors: ['purple', '#FF8800', 'ff0000'] }).colors, ['purple', '#ff8800', '#ff0000']);
+  for (const colors of [['purple', 'pink'], ['#ff88'], 'purple', Array(33).fill('blue')]) assert.deepEqual(parseSettings({ colors }).colors, [], String(colors));
+  const query = settingsQuery({ ...DEFAULTS, colors: ['purple', '#ff8800'] }, null);
+  assert.equal(query, 'colors=purple,ff8800');
+  assert.deepEqual(settingsFromQuery(`?${query}`).settings.colors, ['purple', '#ff8800']);
+  // The colour a node gets: its pick, otherwise the default order (which never uses red).
+  assert.equal(nodeColor([], 0), 'var(--blue)');
+  assert.equal(nodeColor(['purple'], 0), 'var(--purple)');
+  assert.equal(nodeColor(['purple', '#ff8800'], 1), '#ff8800');
+  assert.equal(nodeColor(['purple'], 3), 'var(--ink)');
+  assert.equal(nodeColor([], 8), 'var(--blue)');
+  assert.ok(!COLORS.includes('var(--red)'));
+  assert.ok(PALETTE.includes('red'));
+  // Custom colours that would be hard to see get a warning for the theme in question.
+  assert.equal(lowContrast('#ffff00'), 'light');
+  assert.equal(lowContrast('#111111'), 'dark');
+  assert.equal(lowContrast('#c0392b'), 'dark');
+  assert.equal(lowContrast('#7a7a7a'), null);
+  assert.equal(lowContrast('purple'), null);
+});
+
+test('the kiosk URL carries only what a rack panel reads, with readable lists', () => {
+  assert.equal(rackQuery(DEFAULTS), '');
+  assert.equal(rackQuery({ ...DEFAULTS, temp: 'f', mem: 'gb', lang: 'ko', range: 15, readings: ['temp', 'power', 'disk', 'clock'], colors: ['purple', '#ff8800'], motion: 'still' }),
+    'temp=f&mem=gb&lang=ko&colors=purple,ff8800&motion=still');
+  assert.deepEqual(parseSettings({ motion: 'bounce' }).motion, 'step');
+  assert.deepEqual(settingsFromQuery('?motion=smooth').settings.motion, 'smooth');
+});
+
+test('with several model servers the pages add up their output, or follow the picked one', async () => {
+  const { modelServers, severalServers, serverName, serverOfNode, pickedServer, combinedInference, viewInference, livePoint } = await import('../public/view-data.js');
+  const at = '2026-10-03T01:00:00.000Z', later = '2026-10-03T01:00:01.000Z';
+  const a = { id: 'a', name: null, nodes: ['1', '2'], inference: { ok: true, engine: 'vLLM', modelName: 'big-model', outputTokensPerSecond: 40, promptTokensPerSecond: 1000, runningRequests: 2, waitingRequests: 1, kvCachePercent: 20, ttftP95RecentSeconds: 0.4, prefixCacheHitPercent: 50, updatedAt: at }, inferenceState: 'serving' };
+  const b = { id: 'b', name: 'Small', nodes: ['3'], inference: { ok: true, engine: 'SGLang', modelName: 'small-model', outputTokensPerSecond: 20, promptTokensPerSecond: 500, runningRequests: 1, waitingRequests: 0, kvCachePercent: 35, ttftP95RecentSeconds: 0.9, updatedAt: later }, inferenceState: 'serving' };
+  const state = { servers: [a, b], inference: a.inference, nodes: { 1: { ok: true, gpu: { temperature: 50 } } }, topology: { nodes: [{ id: '1' }, { id: '2' }, { id: '3' }] } };
+  assert.equal(severalServers(state), true);
+  assert.deepEqual([serverName(a), serverName(b), serverName({ id: 'c', inference: { ok: false } })], ['big-model', 'Small', 'c']);
+  assert.equal(serverOfNode(state.servers, '3').id, 'b');
+  assert.equal(serverOfNode(state.servers, '9'), null);
+  assert.equal(pickedServer(state.servers, 'b').id, 'b');
+  assert.equal(pickedServer(state.servers, 'gone').id, 'a');
+  const all = combinedInference(state.servers);
+  assert.deepEqual([all.ok, all.modelName, all.engine, all.outputTokensPerSecond, all.runningRequests, all.waitingRequests, all.kvCachePercent, all.ttftP95RecentSeconds, all.prefixCacheHitPercent, all.updatedAt],
+    [true, 'big-model | Small', 'vLLM + SGLang', 60, 3, 1, 35, 0.9, null, later]);
+  // A server that does not answer adds nothing; with none answering the reading is not ok.
+  assert.equal(combinedInference([a, { ...b, inference: { ok: false, error: 'fetch failed' } }]).outputTokensPerSecond, 40);
+  assert.equal(combinedInference([{ ...a, inference: { ok: false, error: 'fetch failed' } }]).ok, false);
+  assert.equal(viewInference(state, { servers: 'all' }).outputTokensPerSecond, 60);
+  assert.equal(viewInference(state, { servers: 'one', server: 'b' }).outputTokensPerSecond, 20);
+  // One server, or a payload from an older server without servers[]: the state's own reading.
+  assert.equal(viewInference({ inference: a.inference }, { servers: 'one', server: 'b' }), a.inference);
+  assert.deepEqual(modelServers({ inference: a.inference, topology: { nodes: [{ id: '1' }] } }).map((server) => [server.id, server.nodes, server.implicit]), [['default', ['1'], true]]);
+  // The live chart sample: totals, each server's own, and the newest server time.
+  const point = livePoint(state);
+  assert.deepEqual([point.at, point.outputTokensPerSecond, point.queue, point.servers.b.outputTokensPerSecond], [Date.parse(later), 60, 1, 20]);
+  assert.equal(livePoint({ inference: a.inference, nodes: {} }).servers, undefined);
+});
+
+test('engine presentation follows reported fields and keeps averages out of p95', async () => {
+  const { engineMetric, combinedInference } = await import('../public/view-data.js');
+  const { default: vm } = await import('node:vm');
+  const reading = { ok: true, reported: { ttftP95RecentSeconds: false, tpotP95RecentSeconds: false, meanDecodeSeconds: true, kvCachePercent: true }, metricKinds: { kvCachePercent: 'context' }, latencyWindowSeconds: 300 };
+  assert.equal(engineMetric(reading, 'ttftP95RecentSeconds').shown, false);
+  assert.equal(engineMetric(reading, 'tpotP95RecentSeconds').key, 'meanDecodeSeconds');
+  assert.equal(engineMetric(reading, 'kvCachePercent').label, 'engine.contextUsed');
+  assert.equal(engineMetric(reading, 'kvCachePercent').help, 'help.contextUsed');
+  assert.equal(engineMetric({ ...reading, runningRequests: 0 }, 'kvCachePercent').idle, true);
+  assert.equal(engineMetric({ ...reading, ok: false, runningRequests: 0 }, 'kvCachePercent').idle, false);
+  assert.equal(engineMetric({ engine: 'Strata', metricKinds: { promptComputeTokensPerSecond: 'request' } }, 'promptComputeTokensPerSecond').label, 'engine.prefill');
+  assert.equal(engineMetric({ ...reading, ok: false }, 'ttftP95RecentSeconds').shown, false);
+  assert.equal(engineMetric(null, 'ttftP95RecentSeconds').shown, true, 'a temporary failure without a known engine stays unknown');
+  assert.equal(engineMetric({ reported: { promptComputeTokensPerSecond: false, promptTokensPerSecond: true } }, 'promptComputeTokensPerSecond').key, 'promptTokensPerSecond');
+  assert.equal(engineMetric({ reported: { promptComputeTokensPerSecond: false, promptTokensPerSecond: false } }, 'promptComputeTokensPerSecond').shown, false);
+  const source = readFileSync(path.join(ROOT, 'public/app.js'), 'utf8');
+  const context = { finite: Number.isFinite, duration: String, t: key => key, unknown: () => 'unknown' };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function recentLatency('), source.indexOf('const serverColor=')), context);
+  assert.equal(context.recentLatency({}, reading, 'ttftP95RecentSeconds'), 'unknown');
+  assert.equal(context.recentLatency({}, { ...reading, reported: { ttftP95RecentSeconds: true } }, 'ttftP95RecentSeconds'), 'engine.noRequests');
+  const server = inference => ({ id: 'a', inference });
+  const mixed = combinedInference([server(reading), server({ ok: true, reported: { kvCachePercent: true, tpotP95RecentSeconds: true, meanDecodeSeconds: false }, kvCachePercent: 10 })]);
+  assert.equal(mixed.reported.kvCachePercent, false, 'memory usage and context occupancy do not combine');
+  assert.equal(mixed.reported.meanDecodeSeconds, false, 'a mixed summary must not replace available p95 with a mean');
+  assert.equal(mixed.reported.ttftP95RecentSeconds, false);
+  assert.equal(mixed.reported.tpotP95RecentSeconds, false);
+  for (const [key, kind] of [['ttftP95RecentSeconds', 'queueExcluded'], ['tpotP95RecentSeconds', 'requestMean']]) {
+    const reported = { [key]: true }, metricKinds = { [key]: kind };
+    const one = server({ ok: true, reported, metricKinds });
+    assert.equal(combinedInference([one, server({ ok: true, reported })]).reported[key], false, key);
+    assert.equal(combinedInference([one, server({ ok: false, reported, metricKinds })]).reported[key], true, 'a failed poll keeps the known definition');
+    assert.equal(combinedInference([one, server({ ok: true, reported: { [key]: false }, metricKinds })]).reported[key], false, key);
+    assert.equal(combinedInference([one, { id: 'unknown' }]).reported[key], false, key);
+  }
+  assert.equal(combinedInference([server({ ...reading, ok: false })]).reported.ttftP95RecentSeconds, false);
+  const mean = { ok: true, reported: { outputTokensPerSecond: false, averageOutputTokensPerSecond: true, averagePromptTokensPerSecond: true, promptTokensPerSecond: false, promptComputeTokensPerSecond: false }, metricKinds: { averageOutputTokensPerSecond: 'sessionMean', averagePromptTokensPerSecond: 'sessionMean' }, outputTokensPerSecond: null, averageOutputTokensPerSecond: 46.2, averagePromptTokensPerSecond: 2247, promptTokensPerSecond: null, promptComputeTokensPerSecond: null };
+  assert.deepEqual(engineMetric(mean, 'outputTokensPerSecond'), { key: 'averageOutputTokensPerSecond', label: 'engine.decodeMean', help: 'help.decodeMean', shown: true, idle: false });
+  assert.equal(engineMetric(mean, 'promptComputeTokensPerSecond').label, 'engine.prefillMean');
+  const allMeans = combinedInference([server(mean), server(mean)]);
+  assert.equal(allMeans.reported.outputTokensPerSecond, false);
+  assert.equal(allMeans.reported.averageOutputTokensPerSecond, false, 'independent session averages are not combined');
+  assert.equal(allMeans.reported.promptComputeTokensPerSecond, false);
+  const mixedMeans = combinedInference([server(mean), server({ ok: true, reported: { outputTokensPerSecond: true, averageOutputTokensPerSecond: false, promptComputeTokensPerSecond: true }, outputTokensPerSecond: 20, promptComputeTokensPerSecond: 1000 })]);
+  assert.equal(mixedMeans.outputTokensPerSecond, 20, 'a session average is never added to live speed');
+  assert.equal(mixedMeans.reported.averageOutputTokensPerSecond, false);
+  assert.equal(mixedMeans.reported.promptComputeTokensPerSecond, true);
+  assert.equal(mixedMeans.promptComputeTokensPerSecond, 1000, 'only the reported prefill rate is summed');
+  const { sampleOf } = await import('../public/mini/mini-view.js');
+  const now = Date.now();
+  assert.equal(sampleOf({ inference: { ...mixedMeans, prefillUpdatedAt: new Date(now).toISOString() }, nodes: {} }, now).prefill, 1000);
+  assert.equal(engineMetric(mean, 'promptComputeTokensPerSecond', { averages: false }).shown, false);
+  const { outputCoverage, rateCoverage } = await import('../public/view-data.js');
+  assert.match(outputCoverage([server(mean), server({ ok: true, outputTokensPerSecond: 20 })]), /1\/2/);
+  const inputServer = server({ ok: true, promptComputeTokensPerSecond: 1000 });
+  assert.match(rateCoverage([server(mean), inputServer], 'promptComputeTokensPerSecond'), /1\/2/);
+  assert.equal(rateCoverage([inputServer], 'promptComputeTokensPerSecond'), '');
+  assert.equal(rateCoverage([server(mean)], 'promptComputeTokensPerSecond'), '');
+});
+
+test('the model servers view is a setting that a settings link carries', () => {
+  assert.equal(DEFAULTS.servers, 'all');
+  assert.deepEqual(parseSettings({ servers: 'one', server: 'b' }), { ...DEFAULTS, servers: 'one', server: 'b' });
+  assert.equal(parseSettings({ servers: 'some', server: 'not an id!' }).servers, 'all');
+  assert.equal(parseSettings({ server: 'not an id!' }).server, '');
+  assert.equal(settingsQuery({ ...DEFAULTS, servers: 'one', server: 'b' }, null), 'servers=one&server=b');
+  assert.deepEqual(settingsFromQuery('?servers=one&server=b').settings, { ...DEFAULTS, servers: 'one', server: 'b' });
+});
+
+test('keyboard shortcuts go by physical key, so they also work with a Korean layout, and never while typing or with a modifier', async () => {
+  const { shortcutAction } = await import('../public/view-data.js');
+  const key = (code, key, extra = {}) => ({ code, key, shiftKey: false, metaKey: false, ctrlKey: false, altKey: false, repeat: false, ...extra });
+  assert.equal(shortcutAction(key('KeyS', 's')), 'scope');
+  assert.equal(shortcutAction(key('KeyL', 'l')), 'tokens');
+  assert.equal(shortcutAction(key('KeyM', 'm')), 'mini');
+  assert.equal(shortcutAction(key('Comma', ',')), 'settings');
+  assert.equal(shortcutAction(key('Slash', '?', { shiftKey: true })), 'keys');
+  // With the Korean layout on, the same keys type ㄴ, ㅣ and ㅡ.
+  assert.equal(shortcutAction(key('KeyS', 'ㄴ')), 'scope');
+  assert.equal(shortcutAction(key('KeyL', 'ㅣ')), 'tokens');
+  assert.equal(shortcutAction(key('KeyM', 'ㅡ')), 'mini');
+  // On AZERTY "," sits where QWERTY has M, and M where QWERTY has ";": the character typed decides.
+  assert.equal(shortcutAction(key('KeyM', ',')), 'settings');
+  assert.equal(shortcutAction(key('Semicolon', 'm')), 'mini');
+  // The browser's own shortcuts (Cmd+L, Ctrl+S), typing in a field, a held key and Shift+letters do nothing.
+  assert.equal(shortcutAction(key('KeyL', 'l', { metaKey: true })), null);
+  assert.equal(shortcutAction(key('KeyS', 's', { ctrlKey: true })), null);
+  assert.equal(shortcutAction(key('KeyM', 'm', { altKey: true })), null);
+  assert.equal(shortcutAction(key('KeyS', 's'), true), null);
+  assert.equal(shortcutAction(key('KeyS', 's', { repeat: true })), null);
+  assert.equal(shortcutAction(key('KeyS', 'S', { shiftKey: true })), null);
+  assert.equal(shortcutAction(key('KeyX', 'x')), null);
 });

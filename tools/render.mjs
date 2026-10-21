@@ -1,8 +1,3 @@
-// Development check: renders the rack panel and the web dashboard with synthetic data (tools/fixtures.mjs) for
-// one to six nodes, the longest ids and names, a 1024 x 600 screen and a phone in headless Chrome, saves PNGs and
-// reports clipped or overlapping text on the rack panel and overflow or script errors on the web page.
-// Nothing is collected and no other machine is contacted.
-//
 //   node tools/render.mjs                 # PNGs go to $OUT or <tmp>/spark-scope-renders
 //   CHROME=/path/to/chrome node tools/render.mjs
 //
@@ -13,13 +8,15 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { fixtureState, usageMonth, MODES } from "./fixtures.mjs";
+import { fixtureState, usageMonth, MODES, LEDGER_MODELS, LEDGER_SCENARIO } from "./fixtures.mjs";
 import { SECURITY_HEADERS } from "../lib/http-guard.mjs";
+import { t } from "../public/i18n.js";
+import { engineMetric } from "../public/view-data.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PUBLIC = path.join(ROOT, "public");
 const OUT = process.env.OUT || path.join(os.tmpdir(), "spark-scope-renders");
-const COUNTS = (process.env.COUNTS || "1,2,3,4,5,6").split(",").map(Number);
+const COUNTS = (process.env.COUNTS || "1,2,3,4,5,6,7,8").split(",").map(Number);
 mkdirSync(OUT, { recursive: true });
 
 function findChrome() {
@@ -34,22 +31,35 @@ function findChrome() {
 }
 
 // ---- fixture server: the real public/ files, /api/state from fixtures ----
+// ledger: serve the ledger scenario on its own clock (LEDGER_SCENARIO in fixtures.mjs) instead of today's date.
 let current = { count: 4, mode: "serving", longNames: false };
-const TYPES = { ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript", ".woff2": "font/woff2" };
+const ledgerShift = LEDGER_SCENARIO.now - Date.now();
+const fixtureNow = () => Date.now() + (current.ledger ? ledgerShift : 0);
+const TYPES = { ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript; charset=utf-8", ".woff2": "font/woff2" };
 // The server's own security headers, so a page that breaks the Content-Security-Policy shows up as a console error.
 const server = createServer((request, response) => {
   for (const [name, value] of Object.entries(SECURITY_HEADERS)) response.setHeader(name, value);
   const url = new URL(request.url, "http://localhost");
   if (url.pathname === "/api/state") {
     if (current.mode === "lost") { response.writeHead(503).end("{}"); return; }
-    const state = fixtureState(current.count, current.mode, Date.now(), { longNames: current.longNames });
+    const state = fixtureState(current.count, current.mode, fixtureNow(), { longNames: current.longNames, servers: current.servers ?? 0, offGroup: current.offGroup ?? false, gpuWorkstations: current.gpuWorkstations ?? 0, engine: current.engine ?? "vLLM", engineIdle: current.engineIdle ?? false, engineDown: current.engineDown ?? false, engineKeyMissing: current.engineKeyMissing ?? false, mixedEngines: current.mixedEngines ?? false, noSpec: current.noSpec ?? false, macNodes: current.macNodes ?? 0, macThermal: current.macThermal, macUnavailable: current.macUnavailable, macPending: current.macPending, macPowerMissing: current.macPowerMissing });
+    if (current.noPrefill) {
+      for (const server of state.servers) for (const key of ["promptTokensPerSecond", "promptComputeTokensPerSecond", "promptCacheTokensPerSecond", "prefixCacheHitPercent"]) server.inference.reported[key] = false;
+    }
+    if (current.mixedLatency) state.servers[1].inference.metricKinds = { ttftP95RecentSeconds: "queueExcluded", tpotP95RecentSeconds: "requestMean" };
+    if (current.unknownGpu) {
+      const [, second, third] = state.topology.nodes.map((meta) => state.nodes[meta.id].gpu);
+      second.memory = { kind: null, totalBytes: null, usedBytes: null, availableBytes: null };
+      delete third.memory;
+      for (const point of state.history) for (const meta of state.topology.nodes.slice(1, 3)) point.nodes[meta.id].memoryAvailableBytes = null;
+    }
     const minutes = Number(url.searchParams.get("minutes") || 60);
-    state.history = state.history.filter((point) => point.at >= Date.now() - minutes * 60_000);
+    state.history = state.history.filter((point) => point.at >= fixtureNow() - minutes * 60_000);
     response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(state));
     return;
   }
   if (url.pathname === "/api/usage") {
-    response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(usageMonth(url.searchParams.get("month"), Date.now())));
+    response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(usageMonth(url.searchParams.get("month"), fixtureNow(), current.ledger ? { start: LEDGER_SCENARIO.start } : {})));
     return;
   }
   const file = path.join(PUBLIC, url.pathname.endsWith("/") ? `${url.pathname}index.html` : url.pathname);
@@ -61,8 +71,7 @@ const base = `http://127.0.0.1:${server.address().port}`;
 
 // ---- minimal DevTools protocol client ----
 // Chrome runs with its background services off (updates, sync, safe browsing, metrics), so the check contacts
-// nothing but the local fixture server. If anything below fails, the finally block at the end (or the exit hook
-// here, for a failure before it) stops Chrome and removes its profile.
+// nothing but the local fixture server.
 const profile = mkdtempSync(path.join(os.tmpdir(), "spark-scope-chrome-"));
 const chrome = spawn(findChrome(), [
   "--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check",
@@ -70,16 +79,20 @@ const chrome = spawn(findChrome(), [
   "--disable-background-networking", "--disable-component-update", "--disable-sync", "--disable-default-apps",
   "--disable-domain-reliability", "--disable-client-side-phishing-detection", "--metrics-recording-only", "--no-pings",
   "about:blank",
-], { stdio: "ignore" });
+], { stdio: ["ignore", "ignore", "pipe"] });
+// Chrome's own messages, shown only if it fails to start.
+let chromeErrors = "";
+chrome.stderr.on("data", (chunk) => { chromeErrors = (chromeErrors + chunk).slice(-4000); });
 const cleanUp = () => {
   chrome.kill();
   rmSync(profile, { recursive: true, force: true });
 };
 process.once("exit", cleanUp);
 const portFile = path.join(profile, "DevToolsActivePort");
-for (let i = 0; i < 100 && !existsSync(portFile); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+// A cold start on a CI runner can take well over ten seconds.
+for (let i = 0; i < 300 && !existsSync(portFile); i++) await new Promise((resolve) => setTimeout(resolve, 100));
 if (!existsSync(portFile)) {
-  console.error("Chrome did not open its DevTools port within 10 seconds");
+  console.error(`Chrome did not open its DevTools port within 30 seconds${chromeErrors ? `; it said:\n${chromeErrors.slice(-2000)}` : ""}`);
   server.close();
   process.exit(1);
 }
@@ -109,7 +122,10 @@ const send = (method, params = {}, sessionId) => new Promise((resolve, reject) =
   socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
 });
 
-async function openPage({ width, height, colorScheme = "dark" }) {
+// shift moves the page's clock (Date) by that many milliseconds, to match the ledger scenario's fixture server.
+// touch makes the page a touch screen (pointer: coarse), like a phone; noPip takes document picture-in-picture away,
+// like Safari.
+async function openPage({ width, height, colorScheme = "dark", shift = 0, touch = false, noPip = false }) {
   const { targetId } = await send("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
   const errors = [];
@@ -126,6 +142,11 @@ async function openPage({ width, height, colorScheme = "dark" }) {
   await call("Log.enable");
   await call("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: width < 600 });
   await call("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }, { name: "prefers-color-scheme", value: colorScheme }] });
+  if (touch) await call("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+  if (noPip) await call("Page.addScriptToEvaluateOnNewDocument", { source: "delete Window.prototype.documentPictureInPicture; delete window.documentPictureInPicture;" });
+  if (shift) await call("Page.addScriptToEvaluateOnNewDocument", { source: `(() => { const Real = Date, shift = ${shift};
+    function Shifted(...args) { return new.target ? (args.length ? new Real(...args) : new Real(Real.now() + shift)) : new Real(Real.now() + shift).toString(); }
+    Shifted.prototype = Real.prototype; Shifted.now = () => Real.now() + shift; Shifted.parse = Real.parse; Shifted.UTC = Real.UTC; globalThis.Date = Shifted; })();` });
   const evaluate = async (expression) => (await call("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true })).result.value;
   const go = async (url) => {
     await call("Page.navigate", { url });
@@ -137,13 +158,16 @@ async function openPage({ width, height, colorScheme = "dark" }) {
     while (Date.now() < end) { if (await evaluate(expression)) return true; await new Promise((resolve) => setTimeout(resolve, 150)); }
     throw new Error(`timed out waiting for ${expression}`);
   };
-  const shoot = async (file, { fullPage = false } = {}) => {
-    let clip = { x: 0, y: 0, width, height, scale: 1 };
+  const shoot = async (file, { fullPage = false, selector = null } = {}) => {
+    // The visible part of the page, wherever it is scrolled to.
+    const [scrollX, scrollY] = await evaluate("[scrollX, scrollY]");
+    let clip = { x: scrollX, y: scrollY, width, height, scale: 1 };
     if (fullPage) {
       const fullHeight = await evaluate("document.documentElement.scrollHeight");
       await call("Emulation.setDeviceMetricsOverride", { width, height: fullHeight, deviceScaleFactor: 1, mobile: width < 600 });
       clip = { x: 0, y: 0, width, height: fullHeight, scale: 1 };
     }
+    if (selector) clip = await evaluate(`(() => { const r = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect(); return { x: scrollX + r.left, y: scrollY + r.top, width: r.width, height: r.height, scale: 1 }; })()`);
     const { data } = await call("Page.captureScreenshot", { format: "png", clip });
     writeFileSync(path.join(OUT, file), Buffer.from(data, "base64"));
     if (fullPage) await call("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: width < 600 });
@@ -206,7 +230,11 @@ const CHECK_WEB = `(() => {
   const issues = [];
   const overflow = document.documentElement.scrollWidth - window.innerWidth;
   if (overflow > 0) issues.push("horizontal overflow " + overflow + "px");
-  for (const el of document.querySelectorAll("#scope h1, #scope h2, .identity h1, .badge, .role span, .reading b, .extra span, .links td, .trend p span, .legend div, .status .sub span")) {
+  // Reading labels stay whole on one line unless Full labels were chosen (Auto switches narrow cards to the short ones).
+  if (document.documentElement.dataset.labels !== "full") for (const el of document.querySelectorAll(".reading small")) {
+    if (el.getClientRects().length && el.scrollWidth > el.clientWidth + 1) issues.push("reading label cut: " + el.innerText.trim().slice(0, 40));
+  }
+  for (const el of document.querySelectorAll("#scope h1, #scope h2, .identity h1, .badge, .role span, .reading b, .extra span, .links td, .trend p span, .legend div, .status .sub span, #tokens h2, #tokens h3, .kpi small, .kpi b, .kpi em, .months > *, .ledger-tabs button, .statement th, .statement td, .model-table th, .model-table td, .cal-day b, .day-detail dt, .day-detail dd, .keys span, .y-ticks span")) {
     if (!el.getClientRects().length) continue;
     if (el.scrollWidth > el.clientWidth + 1 && getComputedStyle(el).textOverflow !== "ellipsis") issues.push("text wider than its box: " + el.textContent.trim().slice(0, 40));
   }
@@ -214,11 +242,141 @@ const CHECK_WEB = `(() => {
     const text = group.querySelector("text").getBBox(), shape = group.querySelector("circle, rect").getBBox();
     if (text.x < shape.x - 1 || text.x + text.width > shape.x + shape.width + 1) issues.push("diagram label outside its node: " + group.querySelector("text").textContent);
   }
+  const grid = document.querySelector("#nodes"), cards = [...grid.children].map((card) => card.getBoundingClientRect());
+  if (grid.getClientRects().length && cards.length) {
+    const right = grid.getBoundingClientRect().right, ends = new Map();
+    for (const card of cards) ends.set(Math.round(card.top), Math.max(ends.get(Math.round(card.top)) ?? 0, card.right));
+    for (const [top, end] of ends) if (right - end > 2) issues.push("empty cell after the node cards in the row at " + top + " px");
+  }
   const svg = document.querySelector(".fabric");
   if (svg && !document.querySelector("#fabric-panel").hidden) {
     const box = svg.getBBox(), view = svg.viewBox.baseVal;
     if (box.x < -1 || box.y < -1 || box.x + box.width > view.width + 1 || box.y + box.height > view.height + 1) issues.push("diagram drawn outside its view box");
   }
+  return issues;
+})()`;
+
+// Token ledger: the figures, the table by model and the chosen view as the scenario expects; the day axis of every
+// chart spans the whole month.
+const CHECK_LEDGER = (view, expect) => `(() => {
+  const issues = [], expect = ${JSON.stringify(expect)};
+  const kpis = [...document.querySelectorAll("#month-metrics .kpi")];
+  if (kpis.length !== expect.kpis) issues.push("figures: " + kpis.length + ", expected " + expect.kpis);
+  const models = document.querySelectorAll("#model-table tbody tr:not(.empty)").length;
+  if (models !== expect.models) issues.push("models: " + models + ", expected " + expect.models);
+  let summary = kpis.map((kpi) => kpi.querySelector("b").textContent).join(" / ") + " | models " + models;
+  if ("${view}" === "statement") {
+    const weeks = document.querySelectorAll(".statement tr.week").length, columns = document.querySelectorAll(".statement thead th").length;
+    if (weeks !== expect.weeks) issues.push("weeks: " + weeks + ", expected " + expect.weeks);
+    for (const row of document.querySelectorAll(".statement tbody tr:not(.empty), .statement tfoot tr")) if (row.children.length !== columns) issues.push("row with " + row.children.length + " cells: " + row.innerText.slice(0, 30));
+    // Each figure ends where its column heading ends.
+    const heads = [...document.querySelectorAll(".statement thead th")].map((th) => th.getBoundingClientRect());
+    for (const row of document.querySelectorAll(".statement tbody tr:not(.empty)")) [...row.children].forEach((cell, i) => { const r = cell.getBoundingClientRect(); if (r.width && Math.abs(r.right - heads[i].right) > 1) issues.push("misaligned column " + i); });
+    summary += " | weeks " + weeks + ", rows " + document.querySelectorAll(".statement tbody th").length;
+  } else if ("${view}" === "calendar") {
+    const days = document.querySelectorAll(".cal-day").length, picked = document.querySelector(".cal-day[aria-pressed=true]");
+    if (days !== expect.days) issues.push("calendar days: " + days + ", expected " + expect.days);
+    if (!picked) issues.push("no day selected");
+    if (!document.querySelector(".day-detail h3")?.textContent) issues.push("no day details");
+    for (const cell of document.querySelectorAll(".cal-day")) for (const part of cell.children) { const a = part.getBoundingClientRect(), b = cell.getBoundingClientRect(); if (a.width && (a.right > b.right + 1 || a.bottom > b.bottom + 1)) issues.push("calendar text outside its day: " + part.textContent); }
+    summary += " | days " + days + ", changed " + document.querySelectorAll(".cal-day .switch").length + ", picked " + (picked?.dataset.day ?? "none");
+  } else {
+    const charts = [...document.querySelectorAll(".lchart")];
+    if (charts.length !== 3) issues.push("charts: " + charts.length);
+    charts.forEach((chart, index) => {
+      // The running total's axis also covers a longer last month.
+      const box = chart.querySelector("svg").viewBox.baseVal, last = Number([...chart.querySelectorAll(".x-ticks span")].at(-1)?.textContent);
+      if (index < 2 ? box.width !== expect.days * 10 || last !== expect.days : box.width < expect.days * 10 || last !== box.width / 10) issues.push("day axis does not span the month: " + box.width / 10 + " days, last label " + last);
+      const area = chart.getBoundingClientRect();
+      for (const tick of chart.querySelectorAll(".x-ticks span, .y-ticks span")) { const r = tick.getBoundingClientRect(); if (r.left < area.left - 2 || r.right > area.right + 2) issues.push("chart label outside its chart: " + tick.textContent); }
+      if (!chart.querySelector("rect:not(.future-track), path")) issues.push("empty chart");
+    });
+    summary += " | bars " + document.querySelectorAll(".lchart rect").length;
+  }
+  return { issues, summary };
+})()`;
+
+// Settings dialog: it stays inside the window, nothing in it is wider than its box, and the preview card fits.
+const CHECK_SETTINGS = `(() => {
+  const issues = [];
+  const dialog = document.querySelector("#settings");
+  if (!dialog.open) return ["settings dialog did not open"];
+  const box = dialog.getBoundingClientRect();
+  if (box.left < -1 || box.right > innerWidth + 1 || box.top < -1 || box.bottom > innerHeight + 1) issues.push("dialog outside the window: " + [box.left, box.top, box.width, box.height].map(Math.round).join(","));
+  for (const el of dialog.querySelectorAll(".settings-frame, .settings-body, .settings-preview, .settings-nav, .settings-foot")) {
+    if (el.getClientRects().length && el.scrollWidth > el.clientWidth + 1) issues.push("dialog part scrolls sideways: ." + el.className);
+  }
+  for (const el of dialog.querySelectorAll("h2, h3, legend, .pills span, .check span, .about dd, .settings-nav button, .settings-foot button, .settings-note, .reading small, .reading b, .memline span, .badge")) {
+    if (el.getClientRects().length && el.scrollWidth > el.clientWidth + 1) issues.push("text wider than its box: " + el.textContent.trim().slice(0, 40));
+  }
+  return issues;
+})()`;
+
+// Korean pages: English words on screen that are neither technical terms kept in English nor data from the fixture
+// (names, hosts, hardware, models, engines, containers, time zones) are text that missed the string table.
+const TERMS = "Mac OS GPU CPU NVMe NIC ACPI TSOC TS0E TS0P TS1E TS1P TGPU TUNC Xid NO MEMORY TP rank TTFT TPOT KV cache Prefill Decode Spec acceptance tok API QSFP SPARK SCOPE Spark Scope MHz GiB GB TiB TB Gb SSH RAM VRAM nvidia smi ms English rack URL DECODE PREFILL CSV Wh Ctrl Cmd Alt";
+function dataWords(state) {
+  const values = [state.usage?.timeZone, state.usage?.modelName, state.inference?.modelName, state.inference?.engine, state.serving?.engine, ...LEDGER_MODELS];
+  for (const node of state.topology?.nodes ?? []) values.push(node.id, node.name, node.host, node.hardware);
+  for (const node of Object.values(state.nodes ?? {})) values.push(node?.container?.name, node?.inference?.engine);
+  for (const link of state.topology?.links ?? []) values.push(link.id, link.label);
+  return values.filter(Boolean).join(" ");
+}
+const CHECK_ENGLISH = (allowed) => `(() => {
+  const allowed = new Set(${JSON.stringify(`${TERMS} ${allowed}`)}.match(/[A-Za-z]{2,}/g));
+  const style = document.createElement('style'); style.textContent = '* { text-transform: none !important; }'; document.head.append(style);
+  const visibleText = document.body.innerText; style.remove();
+  const words = (visibleText.match(/[A-Za-z]{2,}/g) ?? []).filter((word) => !allowed.has(word));
+  return [...new Set(words)];
+})()`;
+// English left on a Korean page is listed at the end; it fails the check only with STRICT_I18N=1, since contributors
+// only add English and the Korean is filled in before a merge.
+const untranslated = new Set();
+const englishLeft = async (page, state) => {
+  const words = await page.evaluate(CHECK_ENGLISH(dataWords(state)));
+  if (process.env.STRICT_I18N === "1") return words.length ? [`untranslated: ${words.join(" ")}`] : [];
+  for (const word of words) untranslated.add(word);
+  return [];
+};
+
+// A "?" explanation opened with a click: it shows text, stays inside the window and leaves its own button uncovered.
+const CHECK_HELP = (selector) => `(async () => {
+  const button = document.querySelector(${JSON.stringify(selector)});
+  if (!button) return { issues: ["no help button " + ${JSON.stringify(selector)}], text: "" };
+  button.scrollIntoView({ block: "center" });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  button.click();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const tip = document.querySelector("#help-tip"), issues = [];
+  if (!tip || tip.hidden || !tip.textContent.trim()) return { issues: ["help did not open: " + ${JSON.stringify(selector)}], text: "" };
+  const box = tip.getBoundingClientRect(), own = button.getBoundingClientRect();
+  if (box.left < 0 || box.top < 0 || box.right > innerWidth || box.bottom > innerHeight) issues.push("help outside the window");
+  if (!(box.bottom <= own.top + 1 || box.top >= own.bottom - 1)) issues.push("help covers its button");
+  if (button.getAttribute("aria-expanded") !== "true") issues.push("help button not marked expanded");
+  return { issues, text: tip.textContent };
+})()`;
+async function checkHelp(web, label, suffix, extra = async () => []) {
+  await web.evaluate("document.querySelector('[data-section=\"units\"]').click()");
+  for (const [where, selector] of [["settings", '[data-help="help.memUnits"]'], ["page", '[data-help="help.ttft"]']]) {
+    // Closing the dialog returns focus to the gear button a moment later, which scrolls the page back to the top.
+    if (where === "page") { await web.evaluate("document.querySelector('#settings').close()"); await new Promise((resolve) => setTimeout(resolve, 300)); }
+    const result = await web.evaluate(CHECK_HELP(selector));
+    const name = `web-${label}-help-${where}${suffix}.png`;
+    await web.shoot(name);
+    report(name, [`help: ${result.text}`], [...result.issues, ...await extra(), ...web.errors.splice(0)]);
+    await web.evaluate("document.body.click()");
+  }
+}
+
+// Mini window: nothing wider than the window or its box, and the short, wide layout within the window's height.
+const CHECK_MINI = `(() => {
+  const issues = [];
+  if (document.documentElement.scrollWidth > innerWidth) issues.push("mini window scrolls sideways");
+  if (innerHeight < 260 && document.documentElement.scrollHeight > innerHeight + 1) issues.push("wide layout taller than the window: " + document.documentElement.scrollHeight);
+  for (const el of document.querySelectorAll(".m-metric b, .m-l1 > span, .m-servers span:not(.m-name), .m-chips span, .m-stats b, .m-runs span, .m-foot span, .m-tabs button, .m-phase span, .m-head > span")) {
+    if (el.getClientRects().length && el.scrollWidth > el.clientWidth + 1 && getComputedStyle(el).textOverflow !== "ellipsis") issues.push("text wider than its box: " + el.textContent.trim().slice(0, 40));
+  }
+  if (!document.querySelector(".m-root")) issues.push("mini window not drawn");
   return issues;
 })()`;
 
@@ -243,7 +401,8 @@ try {
       const name = `rack-${count}-node-${mode}.png`;
       await rack.shoot(name);
       const missingFonts = Object.entries(result.fonts).filter(([, ok]) => !ok).map(([font]) => `font not loaded: ${font}`);
-      report(name, [...result.bays, `band: ${result.band}`], [...result.issues, ...missingFonts, ...rack.errors.splice(0)]);
+      const bayCount = result.bays.length === Math.min(count, 4) ? [] : [`${result.bays.length} bays for ${count} nodes`];
+      report(name, [...result.bays, `band: ${result.band}`], [...result.issues, ...bayCount, ...missingFonts, ...rack.errors.splice(0)]);
     }
     // Lost connection: the next poll fails and the panel dims.
     current = { count, mode: "serving" };
@@ -268,6 +427,26 @@ try {
     report(name, [...result.bays, `truncated: ${result.truncated.join(" / ") || "none"}`], [...result.issues, ...rack.errors.splice(0)]);
   }
   current = { count: 4, mode: "serving", longNames: false };
+  // The rack panel's own settings from its address: °F, GB, node colours and a still band.
+  for (const [count, mode] of [[4, "serving"], [4, "fault"], [6, "serving"]]) {
+    current = { count, mode, longNames: false };
+    await rack.go(`${base}/rack/?temp=f&mem=gb&colors=purple,ff8800&motion=still`);
+    await rack.waitFor("document.querySelectorAll('.bay').length > 0 && !document.querySelector('.bay:empty')");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const result = await rack.evaluate(CHECK_RACK);
+    const look = await rack.evaluate(`(() => ({
+      units: [...document.querySelectorAll(".temp sup")].map((el) => el.textContent).join(" ") + " | " + [...document.querySelectorAll(".meter span em")].map((el) => el.textContent).slice(0, 2).join(" "),
+      bars: [...document.querySelectorAll(".bay")].slice(0, 3).map((bay) => getComputedStyle(bay.querySelector(".bar i") ?? bay).backgroundColor),
+      band: getComputedStyle(document.querySelector("#band-svg")).transitionDuration,
+    }))()`);
+    const problems = [...result.issues, ...rack.errors.splice(0)];
+    if (!/°F/.test(look.units) || !/GB|TB/.test(look.units)) problems.push("units not applied: " + look.units);
+    if (count === 4 && mode === "serving" && (look.bars[0] !== "rgb(195, 166, 239)" || look.bars[1] !== "rgb(255, 136, 0)")) problems.push("node colours not applied: " + look.bars.join(" / "));
+    if (look.band !== "0s") problems.push("band still moves: " + look.band);
+    const name = `rack-${count}-node-${mode}-options.png`;
+    await rack.shoot(name);
+    report(name, [`units: ${look.units}`, `bars: ${look.bars.join(" / ")}`], problems);
+  }
   // A wider bar display (2560 x 480) with the width parameter.
   const wide = await openPage({ width: 2560, height: 480 });
   current = { count: 4, mode: "serving" };
@@ -294,16 +473,59 @@ try {
     }
   }
   await small.close();
-  await rack.close();
 
-  // Web dashboard at desktop and phone widths.
-  for (const [label, width, height, scheme] of [["desktop", 1440, 1000, "light"], ["phone", 390, 844, "dark"]]) {
+  // The rack panel in Korean (?lang=ko): one, four and six nodes, a lost connection, and the 1024 x 600 screen.
+  for (const count of [1, 4, 6].filter((count) => COUNTS.includes(count))) {
+    for (const mode of ["serving", "fault"]) {
+      current = { count, mode, longNames: false };
+      await rack.go(`${base}/rack/?lang=ko`);
+      await rack.waitFor("document.querySelectorAll('.bay').length > 0 && !document.querySelector('.bay:empty')");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const result = await rack.evaluate(CHECK_RACK);
+      const lang = await rack.evaluate("document.documentElement.lang");
+      const name = `rack-${count}-node-${mode}-ko.png`;
+      await rack.shoot(name);
+      report(name, [...result.bays, `band: ${result.band}`, `truncated: ${result.truncated.join(" / ") || "none"}`], [...result.issues, ...(lang === "ko" ? [] : [`page language ${lang}`]), ...await englishLeft(rack, fixtureState(count, mode)), ...rack.errors.splice(0)]);
+    }
+  }
+  current = { count: 4, mode: "serving", longNames: false };
+  await rack.go(`${base}/rack/?lang=ko`);
+  await rack.waitFor("document.querySelectorAll('.bay').length > 0");
+  current = { count: 4, mode: "lost", longNames: false };
+  await rack.waitFor("document.querySelector('#screen').classList.contains('stale')");
+  const lostKo = await rack.evaluate(CHECK_RACK);
+  await rack.shoot("rack-4-node-lost-ko.png");
+  report("rack-4-node-lost-ko.png", [`band: ${lostKo.band}`], [...lostKo.issues, ...await englishLeft(rack, fixtureState(4, "serving"))]);
+  rack.errors.splice(0);
+  await rack.close();
+  const smallKo = await openPage({ width: 1024, height: 600 });
+  for (const count of [1, 2, 3, 4]) {
+    for (const mode of ["serving", "fault"]) {
+      current = { count, mode, longNames: false };
+      await smallKo.go(`${base}/rack/?width=819&lang=ko`);
+      await smallKo.waitFor("document.querySelectorAll('.bay').length > 0 && !document.querySelector('.bay:empty')");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const result = await smallKo.evaluate(CHECK_RACK);
+      const name = `rack-${count}-node-${mode}-1024x600-width-819-ko.png`;
+      await smallKo.shoot(name);
+      report(name, [`band: ${result.band}`, `truncated: ${result.truncated.join(" / ") || "none"}`], [...result.issues, ...await englishLeft(smallKo, fixtureState(count, mode)), ...smallKo.errors.splice(0)]);
+    }
+  }
+  await smallKo.close();
+
+  const allCounts = [...COUNTS.map((count) => [count, false]), [4, true]];
+  for (const [label, width, height, scheme, counts, modes] of [
+    ["desktop", 1440, 1000, "light", allCounts, ["serving", "fault"]],
+    ["tablet", 1024, 768, "light", COUNTS.filter((count) => count >= 4).map((count) => [count, false]), ["serving"]],
+    ["tablet-768", 768, 1024, "light", [[5, false], [7, false]], ["serving"]],
+    ["phone", 390, 844, "dark", allCounts, ["serving", "fault"]],
+  ]) {
     const web = await openPage({ width, height, colorScheme: scheme });
-    for (const [count, longNames] of [...COUNTS.map((count) => [count, false]), [4, true]]) {
-      for (const mode of ["serving", "fault"]) {
+    for (const [count, longNames] of counts) {
+      for (const mode of modes) {
         current = { count, mode, longNames };
         await web.go(`${base}/`);
-        await web.waitFor("document.querySelectorAll('#nodes .node').length > 0 && document.querySelector('#updated-at').textContent !== 'waiting'");
+        await web.waitFor("document.querySelectorAll('#nodes .node').length > 0 && /\\d/.test(document.querySelector('#updated-at').textContent)");
         await new Promise((resolve) => setTimeout(resolve, 300));
         const issues = await web.evaluate(CHECK_WEB);
         const info = await web.evaluate(`(() => ({
@@ -318,6 +540,843 @@ try {
     }
     await web.close();
   }
+
+  // Settings dialog at desktop and phone widths, one PNG per section, then a settings link (°F, GB, 12-hour clock,
+  // 15-minute range) that the page applies and removes from the address.
+  for (const [label, width, height, scheme] of [["desktop", 1440, 1000, "light"], ["phone", 390, 844, "dark"]]) {
+    const web = await openPage({ width, height, colorScheme: scheme });
+    current = { count: 4, mode: "serving", longNames: false };
+    await web.go(`${base}/`);
+    await web.waitFor("document.querySelectorAll('#nodes .node').length > 0 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+    await web.evaluate("document.querySelector('#settings-open').click()");
+    for (const section of ["card", "colors", "units", "dashboard", "about"]) {
+      await web.evaluate(`document.querySelector('[data-section="${section}"]').click()`);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const issues = await web.evaluate(CHECK_SETTINGS);
+      const name = `web-${label}-settings-${section}.png`;
+      await web.shoot(name);
+      report(name, [], [...issues, ...web.errors.splice(0)]);
+    }
+    // Selecting a reading on the preview card opens its slot in Node card.
+    await web.evaluate(`document.querySelector('[data-section="units"]').click(); document.querySelector('#preview-nodes .reading[data-slot="2"]').click()`);
+    const picked = await web.evaluate("[document.querySelector('[data-section=card]').getAttribute('aria-current'), document.activeElement?.dataset.slot ?? null, Boolean(document.querySelector('.slots label.flash'))]");
+    report(`web-${label}-settings-preview-pick`, [`section current: ${picked[0]}, focused slot: ${picked[1]}, highlighted: ${picked[2]}`], picked[0] === "true" && picked[1] === "2" && picked[2] ? [] : ["selecting a preview reading did not open its slot"]);
+    // Rack settings: hidden until a rack panel has been seen, shown on request, with the kiosk URL.
+    await web.evaluate(`document.querySelector('[data-section="dashboard"]').click()`);
+    const before = await web.evaluate("[document.querySelector('[data-section=rack]').hidden, document.querySelector('#rack-hint').hidden]");
+    await web.evaluate("document.querySelector('#rack-show').click()");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const rackIssues = await web.evaluate(CHECK_SETTINGS);
+    const kiosk = await web.evaluate("document.querySelector('#kiosk-url').value");
+    if (!before[0] || before[1]) rackIssues.push("rack settings shown before a rack panel was seen");
+    if (!/\/rack\/$/.test(kiosk)) rackIssues.push("kiosk URL: " + kiosk);
+    await web.shoot(`web-${label}-settings-rack.png`);
+    report(`web-${label}-settings-rack.png`, [`kiosk: ${kiosk}`], [...rackIssues, ...web.errors.splice(0)]);
+    await checkHelp(web, label, "");
+    await web.go(`${base}/?temp=f&mem=gb&clock=12&range=15`);
+    await web.waitFor("document.querySelectorAll('#nodes .node').length > 0 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const linked = await web.evaluate(`(() => ({
+      address: location.search,
+      units: [...document.querySelectorAll('#nodes .node:first-child .reading em')].map((em) => em.textContent).join(" "),
+      updated: document.querySelector('#updated-at').textContent,
+      range: document.querySelector('[data-range][aria-pressed=true]')?.textContent,
+      stored: localStorage.getItem('spark-scope-settings'),
+    }))()`);
+    const problems = [...await web.evaluate(CHECK_WEB), ...web.errors.splice(0)];
+    if (linked.address) problems.push("settings link left in the address: " + linked.address);
+    if (!/°F/.test(linked.units) || !/GB/.test(linked.units)) problems.push("units not applied: " + linked.units);
+    if (!/[AP]M/.test(linked.updated)) problems.push("12-hour clock not applied: " + linked.updated);
+    if (linked.range !== "15m") problems.push("chart range not applied: " + linked.range);
+    const name = `web-${label}-settings-link.png`;
+    await web.shoot(name, { fullPage: true });
+    report(name, [`units: ${linked.units}`, `updated: ${linked.updated}`, `stored: ${linked.stored}`], problems);
+    // A card set up like a setup shared on social media: °F, disk used in a slot and a root filesystem bar; engine
+    // panel and trends hidden.
+    await web.evaluate("localStorage.clear()");
+    await web.go(`${base}/?temp=f&readings=temp,power,disk,clock&bars=unified,disk&hide=engine,trends&colors=purple,ff8800`);
+    await web.waitFor("document.querySelectorAll('#nodes .node').length > 0 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const card = await web.evaluate(`(() => ({
+      readings: [...document.querySelectorAll('#nodes .node:first-child .reading')].map((r) => r.innerText.replace(/\\s+/g, " ")).join(" / "),
+      bars: [...document.querySelectorAll('#nodes .node:first-child [data-bar]')].map((b) => b.innerText.replace(/\\s+/g, " ")).join(" / "),
+      hidden: [document.querySelector('#engines').hidden, document.querySelector('.trends').hidden, document.querySelector('.lower').classList.contains('single')],
+      colors: [...document.querySelectorAll('#nodes .node h2')].slice(0, 2).map((h) => getComputedStyle(h, '::before').backgroundColor).concat([...document.querySelectorAll('#fabric-nodes circle')].slice(0, 2).map((c) => getComputedStyle(c).stroke)),
+      purple: getComputedStyle(document.documentElement).getPropertyValue('--purple').trim(),
+    }))()`);
+    const cardProblems = [...await web.evaluate(CHECK_WEB), ...web.errors.splice(0)];
+    if (!/Disk used/.test(card.readings) || !/°F/.test(card.readings)) cardProblems.push("readings not applied: " + card.readings);
+    if (!/Root filesystem/.test(card.bars)) cardProblems.push("root filesystem bar missing: " + card.bars);
+    if (card.hidden.some((value) => !value)) cardProblems.push("panels not hidden: " + card.hidden.join(","));
+    // The first two nodes in purple and #ff8800, on the cards and in the interconnect diagram.
+    const hex = (rgb) => "#" + (rgb.match(/\d+/g) ?? []).slice(0, 3).map((n) => Number(n).toString(16).padStart(2, "0")).join("");
+    const [card1, card2, ring1, ring2] = card.colors.map(hex);
+    if (card1 !== card.purple || ring1 !== card.purple || card2 !== "#ff8800" || ring2 !== "#ff8800") cardProblems.push("node colours not applied: " + card.colors.join(" / ") + " (purple " + card.purple + ")");
+    await web.shoot(`web-${label}-card-setup.png`, { fullPage: true });
+    report(`web-${label}-card-setup.png`, [`readings: ${card.readings}`, `bars: ${card.bars}`], cardProblems);
+    await web.evaluate("localStorage.clear()");
+    await web.close();
+  }
+
+  // The two other designs: the main view, the token ledger and the settings dialog. Console stays dark even with a
+  // light system theme; in Soft the ring value ("88%" as one unit) and its label sit centred on the ring.
+  for (const [design, label, width, height, scheme] of [["console", "desktop", 1440, 1000, "light"], ["console", "phone", 390, 844, "dark"], ["soft", "desktop", 1440, 1000, "light"], ["soft", "desktop", 1440, 1000, "dark"], ["soft", "phone", 390, 844, "dark"]]) {
+    const web = await openPage({ width, height, colorScheme: scheme });
+    current = { count: 4, mode: "serving", longNames: false };
+    await web.go(`${base}/?design=${design}`);
+    await web.waitFor("document.querySelectorAll('#nodes .node').length > 0 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const look = await web.evaluate(`(() => {
+      const gauge = document.querySelector('#nodes .node .gauge'), value = gauge.querySelector('strong'), label = gauge.querySelector('span');
+      const range = document.createRange(); range.selectNodeContents(value);
+      const g = gauge.getBoundingClientRect(), v = range.getBoundingClientRect(), l = label.getBoundingClientRect();
+      return { design: document.documentElement.dataset.design, scheme: getComputedStyle(document.documentElement).colorScheme,
+        dx: (v.left + v.right) / 2 - (g.left + g.right) / 2, dy: (Math.min(v.top, l.top) + Math.max(v.bottom, l.bottom)) / 2 - (g.top + g.bottom) / 2 };
+    })()`);
+    const problems = [...await web.evaluate(CHECK_WEB), ...web.errors.splice(0)];
+    if (look.design !== design) problems.push("design not applied: " + look.design);
+    if (design === "console" && look.scheme !== "dark") problems.push("Console is not dark: " + look.scheme);
+    if (design === "soft" && (Math.abs(look.dx) > 1.5 || Math.abs(look.dy) > 1.5)) problems.push(`ring value off centre by ${look.dx.toFixed(1)}, ${look.dy.toFixed(1)} px`);
+    const name = `web-${label}-${design}-${scheme}.png`;
+    await web.shoot(name, { fullPage: true });
+    report(name, [`ring value offset: ${look.dx.toFixed(1)}, ${look.dy.toFixed(1)} px`], problems);
+    await web.evaluate("document.querySelector('#tab-tokens').click()");
+    await web.waitFor("document.querySelectorAll('#ledger-panel .statement tbody tr').length > 1");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await web.shoot(`web-${label}-${design}-${scheme}-tokens.png`, { fullPage: true });
+    report(`web-${label}-${design}-${scheme}-tokens.png`, [], [...await web.evaluate(CHECK_WEB), ...web.errors.splice(0)]);
+    await web.evaluate("document.querySelector('#tab-scope').click(); document.querySelector('#settings-open').click()");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await web.shoot(`web-${label}-${design}-${scheme}-settings.png`);
+    report(`web-${label}-${design}-${scheme}-settings.png`, [], [...await web.evaluate(CHECK_SETTINGS), ...web.errors.splice(0)]);
+    await web.evaluate("localStorage.clear()");
+    await web.close();
+  }
+
+  // The mini window (/mini/, the same view the picture-in-picture window shows): Glance, Scope and Runs (with one
+  // recorded run) behind tabs in the default size, Glance in a short, wide window and all three stacked in a window
+  // taller than 720 px, in each design, and the default size in Korean.
+  for (const [design, scheme, lang] of [["default", "dark", "en"], ["console", "dark", "en"], ["soft", "light", "en"], ["default", "light", "ko"]]) {
+    for (const [shape, width, height] of [["tall", 340, 560], ["wide", 520, 190], ["stacked", 340, 1100]]) {
+      if (lang === "ko" && shape !== "tall") continue;
+      const page = await openPage({ width, height, colorScheme: scheme });
+      current = { count: 4, mode: "serving", longNames: false };
+      await page.go(`${base}/mini/`);
+      await page.evaluate(`localStorage.clear(); localStorage.setItem("spark-scope-settings", JSON.stringify({ design: "${design}", lang: "${lang}" }))`);
+      await page.go(`${base}/mini/`);
+      await page.waitFor("document.querySelector('.m-metric') !== null");
+      for (const tab of shape === "tall" ? ["glance", "scope", "runs"] : shape === "stacked" ? ["all"] : ["glance"]) {
+        await page.evaluate(`document.querySelector('[data-tab="${tab}"]')?.click()`);
+        if (tab === "runs" || tab === "all") {
+          await page.evaluate(`document.querySelector('[data-run="start"]').click()`);
+          await new Promise((resolve) => setTimeout(resolve, 4500));
+          await page.evaluate(`document.querySelector('[data-run="stop"]').click()`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const issues = await page.evaluate(CHECK_MINI);
+        const layout = await page.evaluate("[!!document.querySelector('.m-stacked'), !!document.querySelector('.m-tabs')]");
+        if (shape === "stacked" ? !layout[0] || layout[1] : layout[0]) issues.push(`expected ${shape === "stacked" ? "stacked parts" : "tabs"}, got stacked ${layout[0]}, tabs ${layout[1]}`);
+        const name = `mini-${shape}-${tab}-${design}-${scheme}${lang === "ko" ? "-ko" : ""}.png`;
+        await page.shoot(name);
+        report(name, [], [...issues, ...(lang === "ko" ? await englishLeft(page, fixtureState(4, "serving")) : []), ...page.errors.splice(0)]);
+      }
+      await page.evaluate("localStorage.clear()");
+      await page.close();
+    }
+  }
+
+  // The mini view inside the dashboard page. A phone (touch, 390 px) opens in it, with the parts stacked and the header
+  // row kept in view; Back returns to the dashboard, the next visit stays there and the button brings the mini view
+  // back. A run being recorded keeps going while the dashboard is shown.
+  for (const [lang, scheme] of [["en", "dark"], ["ko", "light"]]) {
+    const page = await openPage({ width: 390, height: 844, colorScheme: scheme, touch: true });
+    const suffix = `${scheme}${lang === "ko" ? "-ko" : ""}`;
+    current = { count: 4, mode: "serving", longNames: false };
+    await page.go(`${base}/`);
+    await page.evaluate(`localStorage.clear(); localStorage.setItem("spark-scope-settings", JSON.stringify({ lang: "${lang}" }))`);
+    await page.go(`${base}/`);
+    await page.waitFor("document.querySelector('.m-inline .m-metric') !== null");
+    await page.evaluate(`document.querySelector('[data-run="start"]').click()`);
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await page.evaluate(`document.querySelector('[data-back]').click()`);
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await page.evaluate(`document.querySelector('#mini-open').click()`);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await page.evaluate(`document.querySelector('[data-run="stop"]').click()`);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const opened = await page.evaluate(`(() => ({ view: document.documentElement.dataset.view ?? null, stacked: !!document.querySelector('.m-inline .m-stacked'), tabs: !!document.querySelector('.m-inline .m-tabs'), shell: getComputedStyle(document.querySelector('#shell')).display, run: JSON.parse(localStorage.getItem('spark-scope-runs') || '[]')[0]?.seconds ?? null }))()`);
+    const problems = [...await page.evaluate(CHECK_MINI), ...(lang === "ko" ? await englishLeft(page, fixtureState(4, "serving")) : []), ...page.errors.splice(0)];
+    if (opened.view !== "mini" || opened.shell !== "none") problems.push(`phone did not open in the mini view: ${JSON.stringify(opened)}`);
+    if (!opened.stacked || opened.tabs) problems.push("phone mini view not stacked");
+    if (!(opened.run >= 4)) problems.push(`the run did not keep recording behind the dashboard: ${opened.run} s`);
+    await page.shoot(`mini-page-phone-${suffix}.png`, { fullPage: true });
+    report(`mini-page-phone-${suffix}.png`, [`recorded run: ${opened.run} s`], problems);
+    const sticky = await page.evaluate("(async () => { scrollTo(0, 700); await new Promise((r) => setTimeout(r, 200)); return Math.round(document.querySelector('.m-root > .m-head').getBoundingClientRect().top); })()");
+    await page.shoot(`mini-page-phone-${suffix}-scrolled.png`);
+    report(`mini-page-phone-${suffix}-scrolled.png`, [`header row top: ${sticky}px`], sticky === 0 ? [] : [`header row scrolled away: ${sticky}px`]);
+    await page.evaluate(`document.querySelector('[data-back]').click()`);
+    await page.go(`${base}/`);
+    await page.waitFor("document.querySelectorAll('#nodes .node').length > 0 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const back = await page.evaluate(`(() => ({ view: document.documentElement.dataset.view ?? null, stored: localStorage.getItem('spark-scope-view'), button: getComputedStyle(document.querySelector('#mini-open')).display }))()`);
+    const backProblems = [...await page.evaluate(CHECK_WEB), ...page.errors.splice(0)];
+    if (back.view !== null || back.stored !== "full") backProblems.push(`Back did not keep the dashboard: ${JSON.stringify(back)}`);
+    if (back.button === "none") backProblems.push("no mini button on the phone dashboard");
+    await page.shoot(`web-phone-after-mini-${suffix}.png`);
+    report(`web-phone-after-mini-${suffix}.png`, [], backProblems);
+    await page.evaluate(`document.querySelector('#mini-open').click()`);
+    await page.waitFor("document.querySelector('.m-inline .m-metric') !== null");
+    if (await page.evaluate("document.documentElement.dataset.view") !== "mini") report(`mini-page-phone-${suffix}-reopen`, [], ["the button did not bring the mini view back"]);
+    await page.evaluate("localStorage.clear()");
+    await page.close();
+  }
+
+  // A desktop browser without document picture-in-picture (Safari): the button switches the page to the mini view, in
+  // one centred column, stacked in a tall window and behind tabs in a short one; the next visit opens in it again.
+  for (const [design, scheme, height] of [["default", "light", 1000], ["soft", "dark", 1000], ["console", "dark", 640]]) {
+    const page = await openPage({ width: 1440, height, colorScheme: scheme, noPip: true });
+    current = { count: 4, mode: "serving", longNames: false };
+    await page.go(`${base}/`);
+    await page.evaluate(`localStorage.clear(); localStorage.setItem("spark-scope-settings", JSON.stringify({ design: "${design}" }))`);
+    await page.go(`${base}/`);
+    await page.waitFor("document.querySelectorAll('#nodes .node').length > 0");
+    await page.evaluate(`document.querySelector('#mini-open').click()`);
+    await page.waitFor("document.querySelector('.m-inline .m-metric') !== null");
+    await page.go(`${base}/`);
+    await page.waitFor("document.querySelector('.m-inline .m-metric') !== null");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const box = await page.evaluate(`(() => { const r = document.querySelector('.m-inline .m-root').getBoundingClientRect(); return { view: document.documentElement.dataset.view ?? null, width: Math.round(r.width), left: Math.round(r.left), right: Math.round(innerWidth - r.right), stacked: !!document.querySelector('.m-stacked'), tabs: !!document.querySelector('.m-inline .m-tabs'), title: document.title }; })()`);
+    const problems = [...await page.evaluate(CHECK_MINI), ...page.errors.splice(0)];
+    if (box.view !== "mini") problems.push("the next visit did not open in the mini view");
+    if (box.width > 460 || Math.abs(box.left - box.right) > 1) problems.push(`mini view not one centred column: ${box.width} px, ${box.left}/${box.right}`);
+    if (height >= 720 ? !box.stacked || box.tabs : box.stacked || !box.tabs) problems.push(`wrong layout for a ${height} px window: stacked ${box.stacked}, tabs ${box.tabs}`);
+    const name = `mini-page-desktop-${design}-${scheme}-${height}.png`;
+    await page.shoot(name);
+    report(name, [`column ${box.width} px, title "${box.title}"`], problems);
+    await page.evaluate(`document.querySelector('[data-back]').click()`);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    if (await page.evaluate("document.documentElement.dataset.view ?? null") !== null) report(`${name} back`, [], ["Back did not return to the dashboard"]);
+    await page.evaluate("localStorage.clear()");
+    await page.close();
+  }
+
+  // The web page in Korean, opened with a settings link (?lang=ko): four nodes serving and with a fault, and the token
+  // ledger with its Korean month and day labels.
+  for (const [label, width, height, scheme] of [["desktop", 1440, 1000, "light"], ["phone", 390, 844, "dark"]]) {
+    const web = await openPage({ width, height, colorScheme: scheme });
+    for (const mode of ["serving", "fault"]) {
+      current = { count: 4, mode, longNames: false };
+      await web.go(`${base}/?lang=ko`);
+      await web.waitFor("document.querySelectorAll('#nodes .node').length > 0 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const issues = await web.evaluate(CHECK_WEB);
+      const info = await web.evaluate(`(() => ({
+        lang: document.documentElement.lang,
+        address: location.search,
+        status: document.querySelector('#status-title').textContent,
+        meta: document.querySelector('#model-meta').textContent,
+        cards: [...document.querySelectorAll('.node')].map((n) => n.querySelector('h2').textContent + ' ' + n.querySelector('.badge').textContent).join(' / '),
+      }))()`);
+      const problems = [...issues, ...await englishLeft(web, fixtureState(4, mode)), ...web.errors.splice(0)];
+      if (info.lang !== "ko") problems.push("page language " + info.lang);
+      if (info.address) problems.push("settings link left in the address: " + info.address);
+      const name = `web-${label}-4-node-${mode}-ko.png`;
+      await web.shoot(name, { fullPage: true });
+      report(name, [`status: ${info.status}`, `header: ${info.meta}`, `cards: ${info.cards}`], problems);
+    }
+    current = { count: 4, mode: "serving", longNames: false };
+    await web.go(`${base}/?lang=ko#tokens`);
+    await web.waitFor("document.querySelectorAll('#ledger-panel .statement tbody th').length > 0");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const ledger = await web.evaluate(`(() => ({
+      title: document.querySelector('#ledger-panel tfoot th').textContent,
+      period: document.querySelector('#month-period').textContent,
+      month: document.querySelector('#token-months [aria-pressed=true]')?.textContent,
+    }))()`);
+    const ledgerName = `web-${label}-tokens-ko.png`;
+    await web.shoot(ledgerName, { fullPage: true });
+    report(ledgerName, [`title: ${ledger.title}`, `period: ${ledger.period}`, `month: ${ledger.month}`], [...await web.evaluate(CHECK_WEB), ...await englishLeft(web, fixtureState(4, "serving")), ...web.errors.splice(0)]);
+    await web.evaluate("localStorage.clear()");
+    await web.close();
+  }
+
+  // The settings dialog: the page opens in English, Korean is picked in the dialog and applies at once to the page
+  // behind it and to the preview; then one PNG per section in Korean.
+  for (const [label, width, height, scheme] of [["desktop", 1440, 1000, "light"], ["phone", 390, 844, "dark"]]) {
+    const web = await openPage({ width, height, colorScheme: scheme });
+    current = { count: 4, mode: "serving", longNames: false };
+    await web.go(`${base}/`);
+    await web.waitFor("document.querySelectorAll('#nodes .node').length > 0 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+    await web.evaluate("document.querySelector('#settings-open').click()");
+    await web.evaluate(`document.querySelector('[data-section="dashboard"]').click()`);
+    const before = await web.evaluate("[document.querySelector('#nodes .badge').textContent, document.querySelector('#preview-nodes .badge').textContent, document.querySelector('#settings-title').textContent]");
+    await web.evaluate("document.querySelector('input[name=lang][value=ko]').click()");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const after = await web.evaluate("[document.querySelector('#nodes .badge').textContent, document.querySelector('#preview-nodes .badge').textContent, document.querySelector('#settings-title').textContent, document.documentElement.lang, localStorage.getItem('spark-scope-settings')]");
+    const switched = [];
+    if (after[3] !== "ko") switched.push("page language " + after[3]);
+    for (const [index, part] of ["page card", "preview card", "dialog title"].entries()) if (after[index] === before[index]) switched.push(`${part} still reads ${after[index]}`);
+    for (const section of ["card", "colors", "units", "dashboard", "about"]) {
+      await web.evaluate(`document.querySelector('[data-section="${section}"]').click()`);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const issues = await web.evaluate(CHECK_SETTINGS);
+      const name = `web-${label}-settings-${section}-ko.png`;
+      await web.shoot(name);
+      report(name, section === "dashboard" ? [`before: ${before.join(" / ")}`, `after: ${after.join(" / ")}`] : [], [...issues, ...(section === "dashboard" ? switched : []), ...await englishLeft(web, fixtureState(4, "serving")), ...web.errors.splice(0)]);
+    }
+    await checkHelp(web, label, "-ko", () => englishLeft(web, fixtureState(4, "serving")));
+    await web.evaluate("localStorage.clear()");
+    await web.close();
+  }
+
+  const gpuCase = { count: 4, mode: "serving", longNames: false, gpuWorkstations: 1, unknownGpu: true };
+  const gpuState = (sparkCount = 4) => fixtureState(sparkCount, "serving", Date.now(), { gpuWorkstations: 1 });
+  const gpuLabels = (lang, [unified, unknown, discrete], sparkCount = 4) => [unified, unknown, unknown, ...Array(sparkCount - 3).fill(unified), discrete].map((key) => (/^V?RAM$/.test(key) ? key : t(key, {}, lang)));
+  for (const [design, label, width, height, scheme, query] of [["default", "desktop", 1440, 1000, "light", ""], ["default", "phone", 390, 844, "dark", "temp=f&mem=gb"], ["console", "desktop", 1440, 1000, "dark", ""], ["soft", "desktop", 1440, 1000, "dark", "mem=gb"], ["soft", "phone", 390, 844, "light", ""], ["default", "desktop", 1440, 1000, "light", "lang=ko"], ["default", "phone", 390, 844, "dark", "lang=ko&temp=f&mem=gb"]]) {
+    const web = await openPage({ width, height, colorScheme: scheme });
+    const lang = query.includes("lang=ko") ? "ko" : "en";
+    current = gpuCase;
+    await web.go(`${base}/?${[design === "default" ? "" : `design=${design}`, query].filter(Boolean).join("&")}`);
+    await web.waitFor("document.querySelectorAll('#nodes .node').length > 0 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const info = await web.evaluate(`(() => ({
+      cards: [...document.querySelectorAll('#nodes .node')].map((n) => ({ label: n.querySelector('[data-node="memory-label"]').textContent, used: n.querySelector('[data-node="memory-used"]').textContent, reading: n.querySelector('.reading[data-slot="2"]').innerText.replace(/\\s+/g, ' '), unknown: n.querySelector('[data-node="memory-used"]').classList.contains('unknown-value') && n.querySelector('[data-reading="2"]').classList.contains('unknown-value') })),
+      heading: document.querySelector('#mem-heading').textContent,
+      legend: document.querySelector('#mem-legend').innerText.replace(/\\s+/g, ' '),
+    }))()`);
+    const problems = [...await web.evaluate(CHECK_WEB), ...(lang === "ko" ? await englishLeft(web, gpuState()) : []), ...web.errors.splice(0)];
+    const expected = gpuLabels(lang, ["node.unifiedMemoryUsage", "node.gpuMemoryUsage", "node.gpuMemoryUsage"]);
+    if (info.cards.length !== expected.length) problems.push(`${info.cards.length} cards, expected ${expected.length}`);
+    info.cards.forEach((card, index) => {
+      if (card.label !== expected[index]) problems.push(`card ${index + 1} label: ${card.label}`);
+      if (card.unknown !== (index === 1 || index === 2)) problems.push(`card ${index + 1} ${card.unknown ? "unknown" : "known"}: ${card.used} | ${card.reading}`);
+    });
+    if (info.heading !== t("trends.gpuMem.heading", {}, lang)) problems.push("trend heading: " + info.heading);
+    if (query.includes("mem=gb") && !/GB/.test(info.cards.at(-1).used)) problems.push("GB not applied: " + info.cards.at(-1).used);
+    const name = `web-${label}-gpu-memory-${design}-${scheme}${query ? `-${query.replace(/[=&]/g, "-")}` : ""}.png`;
+    await web.shoot(name, { fullPage: true });
+    report(name, [...info.cards.map((card) => `${card.label}: ${card.used} | ${card.reading}`), `trend: ${info.heading} | ${info.legend}`], problems);
+    await web.evaluate("localStorage.clear()");
+    await web.close();
+  }
+  for (const [design, scheme, lang] of [["default", "dark", "en"], ["console", "dark", "en"], ["soft", "light", "en"], ["default", "light", "ko"]]) {
+    const page = await openPage({ width: 340, height: 560, colorScheme: scheme });
+    current = gpuCase;
+    await page.go(`${base}/mini/`);
+    await page.evaluate(`localStorage.clear(); localStorage.setItem("spark-scope-settings", JSON.stringify({ design: "${design}", lang: "${lang}" }))`);
+    await page.go(`${base}/mini/`);
+    await page.waitFor("document.querySelector('.m-metric') !== null");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const info = await page.evaluate(`(() => ({
+      rows: [...document.querySelectorAll('.m-l2')].map((row) => row.children[2].textContent + ' ' + row.querySelector('.m-mem i').style.width),
+      most: document.querySelector('.m-spread span:nth-child(2)').textContent,
+    }))()`);
+    const problems = [...await page.evaluate(CHECK_MINI), ...(lang === "ko" ? await englishLeft(page, gpuState()) : []), ...page.errors.splice(0)];
+    const expected = gpuLabels(lang, ["mini.mem", "mini.mem", "mini.gpuMem"]);
+    if (info.rows.length !== expected.length) problems.push(`${info.rows.length} rows, expected ${expected.length}`);
+    info.rows.forEach((row, index) => {
+      if (!row.startsWith(expected[index] + " ")) problems.push(`row ${index + 1} label: ${row}`);
+      if ((index === 1 || index === 2) !== row.endsWith(" 0%")) problems.push(`row ${index + 1} bar: ${row}`);
+    });
+    if (!info.most.startsWith(t("mini.mostGpuMemory", {}, lang))) problems.push("most memory: " + info.most);
+    const name = `mini-gpu-memory-${design}-${scheme}${lang === "ko" ? "-ko" : ""}.png`;
+    await page.shoot(name);
+    report(name, [`rows: ${info.rows.join(" / ")}`, `most: ${info.most}`], problems);
+    await page.evaluate("localStorage.clear()");
+    await page.close();
+  }
+  for (const [width, height, query] of [[1920, 480, ""], [1920, 480, "?lang=ko&temp=f&mem=gb"], [1024, 600, "?width=819&lang=ko"]]) {
+    const page = await openPage({ width, height });
+    const lang = query.includes("lang=ko") ? "ko" : "en";
+    current = { ...gpuCase, count: 3 };
+    await page.go(`${base}/rack/${query}`);
+    await page.waitFor("document.querySelectorAll('.bay').length > 0 && !document.querySelector('.bay:empty')");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const result = await page.evaluate(CHECK_RACK);
+    const meters = await page.evaluate("[...document.querySelectorAll('.bay')].map((bay) => { const meter = bay.querySelectorAll('.meter')[1]; return meter ? meter.querySelector('span').firstChild.textContent + ' ' + meter.querySelector('b').textContent : 'no meters'; })");
+    const problems = [...result.issues, ...(lang === "ko" ? await englishLeft(page, gpuState(3)) : []), ...page.errors.splice(0)];
+    const expected = gpuLabels(lang, ["RAM", "rack.meter.memory", "VRAM"], 3);
+    if (meters.length !== expected.length) problems.push(`${meters.length} bays, expected ${expected.length}`);
+    meters.forEach((meter, index) => {
+      if (!meter.startsWith(expected[index] + " ")) problems.push(`bay ${index + 1} meter: ${meter}`);
+      if ((index === 1 || index === 2) !== meter.endsWith(" —%")) problems.push(`bay ${index + 1} value: ${meter}`);
+    });
+    const name = `rack-4-node-gpu-memory-${width}x${height}${query ? `-${query.slice(1).replace(/[=&]/g, "-")}` : ""}.png`;
+    await page.shoot(name);
+    report(name, [`meters: ${meters.join(" / ")}`, ...result.bays, `truncated: ${result.truncated.join(" / ") || "none"}`], problems);
+    await page.close();
+  }
+
+  for (const [width, height] of [[1440, 1000], [768, 1024], [390, 844]]) for (const design of ["default", "console", "soft"]) for (const lang of ["en", "ko"]) for (const macNodes of width === 1440 && design === "default" ? [2, 1] : [2]) {
+    const web = await openPage({ width, height });
+    current = { count: 2, mode: "serving", macNodes };
+    await web.go(`${base}/?design=${design}&lang=${lang}`);
+    await web.evaluate("localStorage.removeItem('spark-scope-view'); document.querySelector('.m-back')?.click()");
+    await web.waitFor("document.querySelectorAll('#nodes .node').length === 2 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+    const info = await web.evaluate(`(() => ({
+      readings: [...document.querySelectorAll('#nodes .node')].map(card => [...card.querySelectorAll('.reading')].filter(item => !item.hidden).map(item => item.innerText.replace(/\\s+/g, ' '))),
+      tempHidden: document.querySelector('#temp-chart').closest('.trend').hidden,
+      trendColumns: getComputedStyle(document.querySelector('.trends')).gridTemplateColumns.split(' ').length,
+      kernel: [...document.querySelectorAll('#nodes [data-node="kernel-summary"]')].map(item => item.textContent),
+    }))()`);
+    const problems = [...await web.evaluate(CHECK_WEB), ...(lang === "ko" ? await englishLeft(web, fixtureState(2, "serving", Date.now(), { macNodes })) : []), ...web.errors.splice(0)];
+    if (info.tempHidden !== (macNodes === 2)) problems.push("Mac temperature trend visibility");
+    if (macNodes === 2 && info.trendColumns !== 1) problems.push("empty temperature trend column");
+    if (info.readings[0].length !== 4 || info.readings[1].length !== 4) problems.push("Mac reading slots: " + JSON.stringify(info.readings));
+    for (const row of info.readings.slice(0, macNodes)) if (!row.join(" ").toLowerCase().includes(t("node.readingShort.thermal", {}, lang).toLowerCase()) || !row.join(" ").includes("2.2")) problems.push("Mac replacement readings missing");
+    if (info.kernel.slice(0, macNodes).some(value => value !== t("node.details", {}, lang))) problems.push("Mac kernel diagnostics shown");
+    const name = `web-mac-${design}-${width}-${lang}${macNodes === 1 ? "-mixed" : ""}.png`;
+    await web.shoot(name, { fullPage: true });
+    report(name, info.readings.map(row => row.join(" / ")), problems);
+    await web.evaluate("localStorage.clear()");
+    await web.close();
+  }
+  for (const [width, height] of [[1920, 480], [1024, 600]]) for (const lang of ["en", "ko"]) {
+    const page = await openPage({ width, height });
+    current = { count: 2, mode: "serving", macNodes: 2 };
+    await page.go(`${base}/rack/?lang=${lang}${width === 1024 ? "&width=819" : ""}`);
+    await page.waitFor("document.querySelectorAll('.bay .meters').length === 2");
+    const result = await page.evaluate(CHECK_RACK);
+    const info = await page.evaluate(`(() => ({ temps: document.querySelectorAll('.bay .temp').length, feet: [...document.querySelectorAll('.bay .foot')].map(item => item.innerText) }))()`);
+    const problems = [...result.issues, ...(lang === "ko" ? await englishLeft(page, fixtureState(2, "serving", Date.now(), { macNodes: 2 })) : []), ...page.errors.splice(0)];
+    if (info.temps || !info.feet[0].includes("17.7") || info.feet[1].trim()) problems.push("Mac rack temperature or system power: " + JSON.stringify(info));
+    const name = `rack-mac-${width}x${height}-${lang}.png`;
+    await page.shoot(name);
+    report(name, [...result.bays, ...info.feet], problems);
+    await page.close();
+  }
+  for (const lang of ["en", "ko"]) {
+    const page = await openPage({ width: 340, height: 560 });
+    current = { count: 1, mode: "serving", macNodes: 1 };
+    await page.go(`${base}/mini/`);
+    await page.evaluate(`localStorage.clear(); localStorage.setItem('spark-scope-settings', JSON.stringify({lang: '${lang}'}))`);
+    await page.go(`${base}/mini/`);
+    await page.waitFor("document.querySelector('.m-spread') !== null");
+    const power = await page.evaluate("document.querySelector('[data-gpu-power]')?.innerText ?? ''");
+    const problems = [...await page.evaluate(CHECK_MINI), ...(lang === "ko" ? await englishLeft(page, fixtureState(1, "serving", Date.now(), { macNodes: 1 })) : []), ...page.errors.splice(0)];
+    if (power) problems.push("unreported GPU power chip shown: " + power);
+    const name = `mini-mac-glance-${lang}.png`;
+    await page.shoot(name);
+    report(name, [power], problems);
+    await page.evaluate("document.querySelector('[data-tab=scope]').click()");
+    const scopeIssues = [...await page.evaluate(CHECK_MINI), ...page.errors.splice(0)];
+    if (await page.evaluate("document.querySelector('.m-temps') !== null")) scopeIssues.push("Mac temperature chart shown");
+    await page.shoot(`mini-mac-scope-${lang}.png`);
+    report(`mini-mac-scope-${lang}.png`, [], scopeIssues);
+    await page.evaluate("localStorage.clear()");
+    await page.close();
+  }
+
+  const MAC_REVIEWS = [
+    { label: "mixed-thermal", count: 4, macNodes: 2, macThermal: [1, 4] },
+    { label: "power-gap", count: 2, macNodes: 2, macPowerMissing: true },
+    { label: "offline", count: 2, macNodes: 2, macUnavailable: true },
+    { label: "pending", count: 2, macNodes: 2, macPending: true },
+    { label: "sensor-slots", count: 2, macNodes: 2, readings: "temp,power,nvme,nic" },
+  ];
+  for (const item of MAC_REVIEWS) for (const lang of ["en", "ko"]) for (const design of item.count === 4 ? ["default", "console", "soft"] : ["default"]) {
+    const web = await openPage({ width: 1440, height: 1000 });
+    current = { ...item, mode: "serving" };
+    await web.go(`${base}/?lang=${lang}&design=${design}${item.readings ? `&readings=${item.readings}` : ""}`);
+    await web.waitFor(`document.querySelectorAll('#nodes .node').length === ${item.count} && /\\d/.test(document.querySelector('#updated-at').textContent)`);
+    const info = await web.evaluate(`(() => {
+      const cards = [...document.querySelectorAll('#nodes .node')], issues = [];
+      for (const card of cards) for (const label of card.querySelectorAll('.reading small span')) {
+        if (!label.getClientRects().length) continue;
+        const range = document.createRange(); range.selectNodeContents(label);
+        if (range.getBoundingClientRect().width > label.closest('.reading').clientWidth + 1) issues.push('reading label too wide: ' + label.textContent);
+      }
+      return { issues, slots: cards.map(card => [...card.querySelectorAll('.reading')].map(slot => ({slot: slot.dataset.slot, hidden: slot.hidden, text: slot.innerText.replace(/\\s+/g, ' ')}))), bars: cards.map(card => card.querySelector('.mem').getBoundingClientRect().top) };
+    })()`);
+    const problems = [...await web.evaluate(CHECK_WEB), ...info.issues, ...(lang === "ko" ? await englishLeft(web, fixtureState(item.count, "serving", Date.now(), item)) : []), ...web.errors.splice(0)];
+    if (info.slots.some(slots => slots.some((slot, index) => slot.hidden || slot.slot !== String(index)))) problems.push("reading slots moved or hidden");
+    if (Math.max(...info.bars) - Math.min(...info.bars) > 1) problems.push("node memory bars misaligned");
+    if (item.macUnavailable || item.macPending) for (const slots of info.slots.slice(0, item.macNodes)) if (slots.some(slot => !slot.text.includes(t("common.unknown", {}, lang)))) problems.push("failed Mac reading is stale");
+    if (item.macPowerMissing && !info.slots[0][1].text.includes(t("common.unknown", {}, lang))) problems.push("power gap did not stay unknown");
+    const name = `web-mac-${item.label}-${design}-${lang}.png`;
+    await web.shoot(name, { fullPage: true }); report(name, info.slots.map(slots => slots.map(slot => slot.text).join(" / ")), problems);
+    if (item.label === "mixed-thermal" && design === "default") {
+      await web.evaluate("document.querySelector('#settings-open').click()");
+      const notes = await web.evaluate("[...document.querySelectorAll('[data-panel=card] .settings-note')].map(note => note.innerText)");
+      const settingsIssues = [...await web.evaluate(CHECK_SETTINGS), ...(lang === "ko" ? await englishLeft(web, fixtureState(item.count, "serving", Date.now(), item)) : []), ...web.errors.splice(0)];
+      if (notes.length !== 3 || notes.some(note => !note.trim())) settingsIssues.push("Mac settings notes missing");
+      await web.shoot(`settings-mac-${lang}.png`); report(`settings-mac-${lang}.png`, notes, settingsIssues);
+    }
+    await web.evaluate("localStorage.clear()"); await web.close();
+  }
+  for (const lang of ["en", "ko"]) {
+    const page = await openPage({ width: 1024, height: 600 });
+    current = { count: 4, mode: "serving", macNodes: 2, macThermal: [1, 3] };
+    await page.go(`${base}/rack/?width=819&lang=${lang}`);
+    await page.waitFor("document.querySelectorAll('.bay .meters').length === 4");
+    const result = await page.evaluate(CHECK_RACK);
+    const info = await page.evaluate(`(() => ({tops: [...document.querySelectorAll('.bay .meters')].map(meters => meters.getBoundingClientRect().top), clipped: [...document.querySelectorAll('.meter em')].filter(detail => detail.scrollWidth > detail.clientWidth + 1).map(detail => detail.innerText), warning: document.querySelectorAll('.cap.warn').length}))()`);
+    const problems = [...result.issues, ...(lang === "ko" ? await englishLeft(page, fixtureState(4, "serving", Date.now(), current)) : []), ...page.errors.splice(0)];
+    if (Math.max(...info.tops) - Math.min(...info.tops) > 1) problems.push("mixed rack meters misaligned");
+    if (info.clipped.length) problems.push("clipped rack detail: " + info.clipped.join(" / "));
+    if (info.warning !== 1) problems.push("thermal caption warning missing");
+    await page.shoot(`rack-mac-mixed-819-${lang}.png`); report(`rack-mac-mixed-819-${lang}.png`, [...result.bays], problems); await page.close();
+    const mini = await openPage({ width: 340, height: 560 });
+    await mini.go(`${base}/mini/`); await mini.evaluate(`localStorage.clear(); localStorage.setItem('spark-scope-settings',JSON.stringify({lang:'${lang}'}))`); await mini.go(`${base}/mini/`);
+    await mini.waitFor("document.querySelector('[data-gpu-power]') !== null");
+    const power = await mini.evaluate("document.querySelector('[data-gpu-power]').innerText");
+    const miniIssues = [...await mini.evaluate(CHECK_MINI), ...(lang === "ko" ? await englishLeft(mini, fixtureState(4, "serving", Date.now(), current)) : []), ...mini.errors.splice(0)];
+    if (!power.includes(t("statusbar.gpuPowerPartial", { reporting: 2, count: 4 }, lang))) miniIssues.push("partial GPU power coverage missing");
+    await mini.shoot(`mini-mac-mixed-${lang}.png`); report(`mini-mac-mixed-${lang}.png`, [power], miniIssues); await mini.evaluate("localStorage.clear()"); await mini.close();
+  }
+
+  const SERVER_CASES = [
+    { count: 2, mode: "serving", label: "2-node-1-1" },
+    { count: 3, mode: "serving", label: "3-node-2-1" },
+    { count: 4, mode: "serving", label: "4-node-2-2" },
+    { count: 4, mode: "serving", offGroup: true, label: "4-node-2-2-off" },
+    { count: 4, mode: "fault", label: "4-node-2-2-fault" },
+    { count: 4, mode: "serving", servers: 3, label: "4-node-1-2-1" },
+    { count: 4, mode: "serving", longNames: true, offGroup: true, label: "4-node-2-2-long-names-off" },
+    { count: 4, mode: "serving", servers: 4, label: "4-node-1-1-1-1" },
+    { count: 4, mode: "serving", gpuWorkstations: 1, label: "5-node-4-1" },
+    { count: 4, mode: "serving", gpuWorkstations: 3, label: "7-node-4-1-1-1" },
+    { count: 4, mode: "serving", gpuWorkstations: 4, label: "8-node-4-1-1-1-1" },
+    { count: 4, mode: "fault", gpuWorkstations: 4, label: "8-node-4-1-1-1-1-fault" },
+    { count: 8, mode: "serving", servers: 4, label: "8-node-2-2-2-2" },
+    { count: 4, mode: "serving", gpuWorkstations: 4, longNames: true, label: "8-node-4-1-1-1-1-long-names" },
+  ];
+  const serverFixture = (item) => ({ count: item.count, mode: item.mode, longNames: Boolean(item.longNames), servers: item.servers ?? (item.gpuWorkstations ? 0 : 2), offGroup: Boolean(item.offGroup), gpuWorkstations: item.gpuWorkstations ?? 0 });
+  const CHECK_STRIP = `(() => {
+    const issues = [], strip = document.querySelector('#servers').getBoundingClientRect(), status = document.querySelector('.status').getBoundingClientRect();
+    if (Math.abs(strip.top - status.bottom) > 1 || strip.bottom > document.querySelector('#nodes').getBoundingClientRect().top + 1) issues.push('server strip not between the status line and the node cards');
+    const lines = new Map();
+    for (const row of document.querySelectorAll('#servers .server-row')) { const box = row.getBoundingClientRect(), top = Math.round(box.top); lines.set(top, [...(lines.get(top) ?? []), box.width]); }
+    for (const widths of lines.values()) if (Math.max(...widths) - Math.min(...widths) > 1) issues.push('uneven server segments: ' + widths.map(Math.round).join(' / '));
+    for (const tag of document.querySelectorAll('#nodes [data-server-tag]:not([hidden])')) if (getComputedStyle(tag).borderLeftStyle !== 'none') issues.push('server name on a card has a border: ' + tag.textContent);
+    for (const role of document.querySelectorAll('#nodes .role')) if (new Set([...role.children].filter((item) => item.getClientRects().length).map((item) => Math.round(item.getBoundingClientRect().top))).size > 1) issues.push('role line wraps: ' + role.innerText.replace(/\\s+/g, ' '));
+    for (const role of document.querySelectorAll('#nodes [data-node="role"]')) if (role.getClientRects().length && role.scrollWidth > role.clientWidth + 1) issues.push('role cut short: ' + role.textContent);
+    for (const item of document.querySelectorAll('#nodes .role > span')) if (item.getClientRects().length && item.scrollWidth > item.clientWidth + 1 && item.title !== item.textContent) issues.push('cut role item without its full title: ' + item.textContent);
+    for (const name of document.querySelectorAll('#servers [data-cell="name"]')) if (name.title !== name.textContent) issues.push('server name without its full title: ' + name.textContent);
+    return { issues, lines: [...lines.values()].map((widths) => widths.length).join(' + ') };
+  })()`;
+  // Every chip on the band keeps its lamp, and its figure while shown, inside the line; only the names may be cut short.
+  const CHECK_CHIPS = `(() => { const line = document.querySelector('#cl-line1').getBoundingClientRect(); return [...document.querySelectorAll('#cl-line1 .chip')].filter((chip) => { const figure = chip.querySelector('b'), last = getComputedStyle(figure).display === 'none' ? chip.querySelector('.lamp') : figure, box = last.getBoundingClientRect(); return box.right > line.right + 1 || box.width < 4; }).map((chip) => 'chip cut off: ' + chip.textContent); })()`;
+  for (const [width, height] of [[1920, 480], [1024, 600]]) {
+    const serversRack = await openPage({ width, height });
+    for (const item of SERVER_CASES) {
+      const queries = width === 1920 ? ["", "?lang=ko", ...(item.label === "4-node-2-2" ? ["?server=b"] : [])] : ["?width=819", "?width=819&lang=ko"];
+      for (const query of queries) {
+        current = serverFixture(item);
+        await serversRack.go(`${base}/rack/${query}`);
+        await serversRack.waitFor("document.querySelectorAll('.bay').length > 0 && !document.querySelector('.bay:empty')");
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const result = await serversRack.evaluate(CHECK_RACK);
+        const chips = await serversRack.evaluate(CHECK_CHIPS);
+        const korean = query.includes("lang=ko");
+        const name = `rack-servers-${item.label}${width === 1024 ? "-1024x600-width-819" : ""}${korean ? "-ko" : query.includes("server=") ? "-server-b" : ""}.png`;
+        await serversRack.shoot(name);
+        const fixture = serverFixture(item);
+        const english = korean ? await englishLeft(serversRack, fixtureState(fixture.count, fixture.mode, Date.now(), fixture)) : [];
+        report(name, [...result.bays, `band: ${result.band}`, `truncated: ${result.truncated.join(" / ") || "none"}`], [...result.issues, ...chips, ...english, ...serversRack.errors.splice(0)]);
+      }
+    }
+    await serversRack.close();
+  }
+  for (const [label, width, height, scheme] of [["desktop", 1440, 1000, "light"], ["desktop-1290", 1290, 900, "light"], ["phone", 390, 844, "dark"], ["phone-320", 320, 640, "dark"]]) {
+    const web = await openPage({ width, height, colorScheme: scheme });
+    for (const item of SERVER_CASES) {
+      for (const query of label.includes("-") ? ["", "?lang=ko"] : ["", "?servers=one&server=b", "?lang=ko"]) {
+        current = serverFixture(item);
+        await web.evaluate("localStorage.clear()");
+        await web.go(`${base}/${query}`);
+        await web.waitFor("document.querySelectorAll('#servers .server-row').length > 1 && /\\d/.test(document.querySelector('#updated-at').textContent)");
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const issues = await web.evaluate(CHECK_WEB);
+        const strip = await web.evaluate(CHECK_STRIP);
+        const info = await web.evaluate(`(() => ({
+          status: document.querySelector('#status-title').textContent,
+          servers: [...document.querySelectorAll('#servers .server-row')].map((row) => row.innerText.replace(/\\s+/g, ' ')).join(' / '),
+          engines: document.querySelectorAll('#engines .engine-block').length,
+        }))()`);
+        const fixture = serverFixture(item);
+        const english = query === "?lang=ko" ? await englishLeft(web, fixtureState(fixture.count, fixture.mode, Date.now(), fixture)) : [];
+        const name = `web-${label}-servers-${item.label}${query === "?lang=ko" ? "-ko" : query ? "-one" : ""}.png`;
+        await web.shoot(name, { fullPage: true });
+        report(name, [`status: ${info.status}`, `servers: ${info.servers}`, `strip lines: ${strip.lines}`, `engine panels: ${info.engines}`], [...issues, ...strip.issues, ...english, ...web.errors.splice(0)]);
+      }
+    }
+    await web.evaluate("localStorage.clear()");
+    await web.close();
+  }
+  const CONTRAST = (selector) => `(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return null;
+    const rgb = (color) => { const n = color.match(/[\\d.]+/g).slice(0, 3).map(Number); return color.startsWith('color(') ? n : n.map((v) => v / 255); };
+    const lum = (color) => rgb(color).map((v) => (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4)).reduce((sum, v, i) => sum + v * [0.2126, 0.7152, 0.0722][i], 0);
+    const a = lum(getComputedStyle(el).color), b = lum(getComputedStyle(document.body).backgroundColor);
+    return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+  })()`;
+  for (const [label, lang, design, scheme] of [["4-node-2-2", "en", "default", "dark"], ["8-node-4-1-1-1-1", "en", "default", "dark"], ["8-node-4-1-1-1-1", "ko", "default", "light"], ["8-node-2-2-2-2", "en", "default", "dark"], ["8-node-4-1-1-1-1", "en", "console", "dark"], ["8-node-4-1-1-1-1", "en", "soft", "light"], ["8-node-4-1-1-1-1-long-names", "en", "soft", "dark"]]) {
+    const item = SERVER_CASES.find((entry) => entry.label === label), fixture = serverFixture(item);
+    for (const [shape, width, height] of [["tall", 340, 560], ["wide", 520, 190], ["stacked", 340, 1100]]) {
+      if ((lang === "ko" || design !== "default") && shape !== "tall") continue;
+      const page = await openPage({ width, height, colorScheme: scheme });
+      current = fixture;
+      await page.go(`${base}/mini/`);
+      await page.evaluate(`localStorage.clear(); localStorage.setItem("spark-scope-settings", JSON.stringify({ lang: "${lang}", design: "${design}" }))`);
+      await page.go(`${base}/mini/`);
+      await page.waitFor("document.querySelector('.m-metric') !== null");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const info = await page.evaluate(`(() => ({
+        rows: [...document.querySelectorAll('.m-servers > div')].filter((row) => [...row.children].some((cell) => cell.getClientRects().length)).map((row) => [...row.children].map((cell) => cell.textContent).join(' ').trim()),
+        nodes: [...document.querySelectorAll('.m-node, .m-wide-nodes > div')].filter((node) => node.getClientRects().length).length,
+        scroll: document.documentElement.scrollHeight,
+      }))()`);
+      const problems = [...await page.evaluate(CHECK_MINI), ...(lang === "ko" ? await englishLeft(page, fixtureState(fixture.count, fixture.mode, Date.now(), fixture)) : []), ...page.errors.splice(0)];
+      const servers = fixtureState(fixture.count, fixture.mode, Date.now(), fixture).servers.length;
+      if (shape !== "wide" && info.rows.length !== servers + 1) problems.push(`${info.rows.length} server rows, expected ${servers} and the total`);
+      if (info.nodes !== fixture.count + fixture.gpuWorkstations) problems.push(`${info.nodes} nodes shown`);
+      if (shape === "tall" && info.scroll > height) problems.push(`Glance taller than the window: ${info.scroll}px`);
+      const contrast = await page.evaluate(CONTRAST(".m-servers .m-serving"));
+      if (shape !== "wide" && !(contrast >= 4.5)) problems.push(`"serving" contrast ${contrast?.toFixed(2)}:1`);
+      const name = `mini-servers-${label}-${shape}-${design}-${scheme}${lang === "ko" ? "-ko" : ""}.png`;
+      await page.shoot(name, { fullPage: shape !== "wide" });
+      report(name, [`servers: ${info.rows.join(" / ")}`, `nodes: ${info.nodes}, page height ${info.scroll}px`, `"serving" contrast ${contrast?.toFixed(2)}:1`], problems);
+      await page.evaluate("localStorage.clear()");
+      await page.close();
+    }
+  }
+
+  for (const [engine, activity] of [["vLLM", "serving"], ["SGLang", "serving"], ["llama.cpp", "serving"], ["Strata", "serving"], ["TensorFold", "serving"], ["llama.cpp", "idle"], ["Strata", "idle"], ["TensorFold", "idle"], ["llama.cpp", "down"], ["Strata", "down"], ["TensorFold", "down"], ["oMLX", "serving"], ["oMLX", "idle"], ["oMLX", "down"], ["oMLX", "key"]]) {
+    current = { count: engine === "oMLX" ? 1 : 4, macNodes: engine === "oMLX" ? 1 : 0, mode: "serving", engine, engineIdle: activity === "idle", engineDown: activity === "down", engineKeyMissing: activity === "key", noSpec: true };
+    const looks = [["en", "default"], ["ko", "default"], ...(activity === "serving" ? [["en", "console"], ["en", "soft"], ["ko", "soft"]] : [])];
+    for (const [lang, design] of looks) {
+      const engineState = fixtureState(current.count, "serving", Date.now(), current);
+      const engineName = engine === "llama.cpp" ? "llamacpp" : engine.toLowerCase();
+      const web = await openPage({ width: 1440, height: 1000 });
+      await web.go(`${base}/?lang=${lang}&design=${design}`);
+      await web.waitFor("/\\d/.test(document.querySelector('#updated-at').textContent)");
+      const fields = await web.evaluate(`(() => Object.fromEntries([...document.querySelectorAll('#engines [data-field]')].map(el => [el.dataset.field, { hidden: el.hidden, labelHidden: el.previousElementSibling.hidden, label: el.previousElementSibling.querySelector('[data-metric-label]').textContent.trim(), value: el.textContent, help: el.previousElementSibling.querySelector('.help')?.dataset.help }])))()`);
+      const problems = [...await web.evaluate(CHECK_WEB), ...(lang === "ko" ? await englishLeft(web, engineState) : []), ...web.errors.splice(0)];
+      for (const [field, info] of Object.entries(fields)) {
+        if (info.hidden !== !engineMetric(engineState.inference, field).shown || info.hidden !== info.labelHidden) problems.push(`wrong visibility: ${field}`);
+        if (["down", "key"].includes(activity) && !info.hidden && info.value !== t("common.unknown", {}, lang)) problems.push(`failed poll is not unknown: ${field}`);
+      }
+      if (engine === "llama.cpp" && fields.tpotP95RecentSeconds.label !== t("engine.meanDecode", {}, lang)) problems.push("mean decode still labelled p95");
+      if (engine === "TensorFold" && fields.promptComputeTokensPerSecond.label !== t("engine.prefill2s", {}, lang)) problems.push("prefill rate lacks its two-second window");
+      if (engine === "Strata" && fields.promptComputeTokensPerSecond.label !== t("engine.prefill", {}, lang)) problems.push("Strata prefill label changes with activity");
+      if (activity === "idle" && !fields.kvCachePercent.hidden && fields.kvCachePercent.value !== t("engine.noRequests", {}, lang)) problems.push("idle context row not marked idle");
+      if (engine === "oMLX") {
+        const note = await web.evaluate("document.querySelector('#plot-note').textContent");
+        if (!note.includes(t(activity === "down" || activity === "key" ? "chart.note.noData" : "chart.note.unsupported", {}, lang))) problems.push("wrong output explanation: " + note);
+        if (activity === "key" && !await web.evaluate("document.querySelector('.status').textContent.includes(" + JSON.stringify(t("engine.apiKeyRequired", {}, lang)) + ")")) problems.push("missing key reason in status");
+        if (activity === "key" && await web.evaluate("document.querySelector('.status').textContent.split(" + JSON.stringify(t("engine.apiKeyRequired", {}, lang)) + ").length") !== 2) problems.push("duplicate API key notice");
+        if (fields.outputTokensPerSecond.label !== t("engine.decodeMean", {}, lang) || fields.promptComputeTokensPerSecond.label !== t("engine.prefillMean", {}, lang)) problems.push("session rates lack average labels");
+        if (!await web.evaluate("document.querySelector('#speed').parentElement.hidden && document.querySelector('#legend-speed').parentElement.hidden && document.querySelector('#avg').parentElement.hidden")) problems.push("unreported live output shown");
+      }
+      if (await web.evaluate("document.querySelector('#today-requests').hidden") !== (engineState.usage.reported.requests === false)) problems.push("unreported ledger requests are visible");
+      if (activity === "serving" && design === "default") {
+        for (const info of Object.values(fields).filter(info => !info.hidden && info.help)) {
+          const result = await web.evaluate(CHECK_HELP(`[data-help="${info.help}"]`));
+          problems.push(...result.issues);
+          if (lang === "ko" && /\bpoll\b/i.test(result.text)) problems.push("untranslated poll in help");
+          await web.evaluate("document.body.click()");
+        }
+      }
+      if (engine === "oMLX" && activity === "key") await web.shoot(`web-omlx-key-${lang}.png`, { selector: ".status" });
+      await web.evaluate("document.querySelector('#engines').scrollIntoView()");
+      const file = `engine-${engineName}-${activity}-${lang}${design === "default" ? "" : `-${design}`}.png`;
+      await web.shoot(file, { selector: "#engines" });
+      report(file, [Object.entries(fields).filter(([, info]) => !info.hidden).map(([, info]) => `${info.label}: ${info.value}`).join(" / ")], problems);
+      if (engine === "llama.cpp" && activity === "serving" && design === "default") await web.shoot(`today-llamacpp-${lang}.png`, { selector: "#today-ledger" });
+      await web.close();
+      const mini = await openPage({ width: 340, height: 640 });
+      await mini.go(`${base}/mini/`);
+      await mini.evaluate(`localStorage.setItem("spark-scope-settings", JSON.stringify({ lang: "${lang}", design: "${design}" }))`);
+      await mini.go(`${base}/mini/`);
+      await mini.waitFor("document.querySelector('.m-metric') !== null");
+      const chips = await mini.evaluate("document.querySelector('.m-chips').textContent");
+      const miniProblems = [...await mini.evaluate(CHECK_MINI), ...(lang === "ko" ? await englishLeft(mini, engineState) : []), ...mini.errors.splice(0)];
+      if (engine === "oMLX" && /KV|TTFT|TPOT/.test(chips)) miniProblems.push("unsupported oMLX chip shown");
+      if (activity === "key" && !await mini.evaluate("document.querySelector('.m-tab-glance').textContent.includes(" + JSON.stringify(t("engine.apiKeyRequired", {}, lang)) + ")")) miniProblems.push("missing Glance key reason");
+      if (engine === "oMLX" && !await mini.evaluate("document.querySelector('.m-metric').textContent.includes(" + JSON.stringify(t("engine.decodeMean", {}, lang)) + ") && !document.querySelector('.m-metric svg')")) miniProblems.push("session mean displayed as a live series");
+      if (engine === "llama.cpp" && /TTFT|TPOT/.test(chips)) miniProblems.push("unsupported latency chip shown");
+      if (engine === "TensorFold" && chips.includes(t("engine.cacheHit", {}, lang))) miniProblems.push("unsupported cache chip shown");
+      if (["llama.cpp", "Strata", "TensorFold"].includes(engine) && activity === "idle" && !chips.includes(`${t("engine.contextUsed", {}, lang)} ${t("engine.noRequests", {}, lang)}`)) miniProblems.push("idle context chip missing or not marked idle");
+      const miniFile = `mini-engine-${engineName}-${activity}-${lang}${design === "default" ? "" : `-${design}`}.png`;
+      await mini.shoot(miniFile);
+      report(miniFile, [chips], miniProblems);
+      if (engine === "llama.cpp" && activity === "serving" && design === "default") {
+        await mini.evaluate("document.querySelector('[data-tab=runs]').click(); document.querySelector('[data-run=start]').click(); document.querySelector('[data-run=stop]').click()");
+        const runText = await mini.evaluate("document.querySelector('.m-tab-runs').textContent");
+        const runFile = `mini-runs-llamacpp-${lang}.png`;
+        await mini.shoot(runFile);
+        report(runFile, [runText], [...await mini.evaluate(CHECK_MINI), ...(/TTFT/.test(runText) ? ["unsupported run TTFT shown"] : []), ...mini.errors.splice(0)]);
+      }
+      if (engine === "oMLX" && design === "default") {
+        await mini.evaluate("document.querySelector('[data-tab=scope]').click()");
+        const scopeText = await mini.evaluate("document.querySelector('.m-tab-scope').textContent");
+        report(`mini-omlx-scope-${activity}-${lang}`, [scopeText], await mini.evaluate("document.querySelector('.m-scope:not(.m-temps)') !== null") ? ["unreported live scope shown"] : scopeText.includes(t(activity === "key" ? "engine.apiKeyRequired" : "mini.scopeUnavailable", {}, lang)) ? [] : ["empty unsupported Scope view"]);
+        await mini.shoot(`mini-omlx-scope-${activity}-${lang}.png`);
+        await mini.evaluate("document.querySelector('[data-tab=runs]').click(); document.querySelector('[data-run=start]').click(); document.querySelector('[data-run=stop]').click()");
+        const text = await mini.evaluate("document.querySelector('.m-tab-runs').textContent");
+        const unsupported = ["mini.run.avgDecode", "mini.run.peakDecode", "mini.run.peakPrefill", "mini.run.slowestTtft"].filter(key => text.includes(t(key, {}, lang)));
+        report(`mini-omlx-runs-${activity}-${lang}`, [text], [...await mini.evaluate(CHECK_MINI), ...unsupported.map(key => `unreported run metric: ${key}`), ...(text.includes(t("common.unknown", {}, lang)) ? ["unsupported run value shown"] : []), ...mini.errors.splice(0)]);
+        await mini.shoot(`mini-omlx-runs-${activity}-${lang}.png`);
+      }
+      await mini.evaluate("localStorage.clear()");
+      await mini.close();
+      if (engine === "oMLX" && design === "default") {
+        const rack = await openPage({ width: 1920, height: 480 });
+        await rack.go(`${base}/rack/?lang=${lang}`);
+        await rack.waitFor("document.querySelectorAll('.bay').length === 1");
+        const result = await rack.evaluate(CHECK_RACK);
+        const problems = [...result.issues, ...(lang === "ko" ? await englishLeft(rack, engineState) : []), ...rack.errors.splice(0)];
+        if (await rack.evaluate("getComputedStyle(document.querySelector('.out')).display !== 'none' || document.querySelector('.out').getClientRects().length !== 0")) problems.push("unreported rack output shown");
+        if (activity === "key" && !result.band.includes(t("engine.apiKeyRequired", {}, lang))) problems.push("missing rack key reason");
+        if (!await rack.evaluate("(() => { const band=document.querySelector(\'.over\'), token=document.querySelector(\'.tok\'); return Math.abs(band.getBoundingClientRect().right-token.getBoundingClientRect().right-parseFloat(getComputedStyle(band).paddingRight))<1; })()")) problems.push("hidden output shifted the token total");
+        const file = `rack-engine-omlx-${activity}-${lang}.png`;
+        await rack.shoot(file);
+        report(file, [result.band], problems);
+        await rack.close();
+      }
+    }
+  }
+
+  for (const [width, lang, needsKey] of [[1440, "en", false], [768, "en", false], [375, "ko", false], [1440, "ko", true]]) {
+    current = { count: 2, macNodes: 1, servers: 2, mode: "serving", engine: "oMLX", mixedEngines: true, engineKeyMissing: needsKey };
+    const state = fixtureState(2, "serving", Date.now(), current), suffix = `${width}-${lang}${needsKey ? "-key" : ""}`;
+    const web = await openPage({ width, height: 1000 });
+    await web.go(`${base}/?lang=${lang}`);
+    await web.waitFor("document.querySelectorAll('#engines [data-field]').length > 10");
+    const issues = [...await web.evaluate(CHECK_WEB), ...(lang === "ko" ? await englishLeft(web, state) : []), ...web.errors.splice(0)];
+    if (!await web.evaluate("document.querySelector('#speed').nextElementSibling.textContent.includes('1/2') && document.querySelector('#legend-output').textContent.includes('1/2')")) issues.push("mixed output coverage missing");
+    await web.shoot(`web-omlx-mixed-${suffix}.png`, { fullPage: true });
+    report(`web-omlx-mixed-${suffix}`, [], issues);
+    await web.close();
+    const mini = await openPage({ width: 340, height: 640 });
+    await mini.go(`${base}/mini/`);
+    await mini.evaluate(`localStorage.setItem('spark-scope-settings', JSON.stringify({ lang: '${lang}' }))`);
+    await mini.go(`${base}/mini/`);
+    await mini.waitFor("document.querySelector('.m-servers') !== null");
+    const grid = await mini.evaluate(`(() => { const rows=[...document.querySelector('.m-servers').children].map(row=>[...row.children].map(el=>el.getBoundingClientRect().left)); return rows.every(row=>row.length===3 && row.every((x,i)=>Math.abs(x-rows[0][i])<1)); })()`);
+    const miniIssues = [...await mini.evaluate(CHECK_MINI), ...(lang === "ko" ? await englishLeft(mini, state) : []), ...mini.errors.splice(0)];
+    if (!grid) miniIssues.push("mixed server columns shifted");
+    if (!await mini.evaluate("[...document.querySelectorAll('.m-pair .m-metric small')].every(el=>el.textContent.includes('1/2')) && document.querySelector('.m-total').textContent.includes('1/2')")) miniIssues.push("mixed mini coverage missing");
+    await mini.shoot(`mini-omlx-mixed-${suffix}.png`);
+    report(`mini-omlx-mixed-${suffix}`, [], miniIssues);
+    for (const tab of ["scope", "runs"]) {
+      await mini.evaluate(`document.querySelector('[data-tab=${tab}]').click()`);
+      const selector = tab === "scope" ? ".m-scope:not(.m-temps) .m-lbl" : ".m-pair .m-metric small";
+      const labels = await mini.evaluate(`(() => [...document.querySelectorAll(${JSON.stringify(selector)})].map(el=>el.textContent))()`);
+      const issues = [...await mini.evaluate(CHECK_MINI), ...mini.errors.splice(0)];
+      if (labels.length !== 2 || labels.some(label=>!label.includes("1/2"))) issues.push("missing mixed " + tab + " rate coverage");
+      if (tab === "scope" && !await mini.evaluate("(() => { const left=document.querySelector('.m-scope .m-left').getBoundingClientRect(), right=document.querySelector('.m-scope .m-right').getBoundingClientRect(); return left.right <= right.left; })()")) issues.push("scope rate labels overlap");
+      const file = `mini-omlx-mixed-${suffix}-${tab}.png`;
+      await mini.shoot(file);
+      report(file, labels, issues);
+    }
+    if (width === 1440 && !needsKey) {
+      await mini.evaluate(`localStorage.clear(); localStorage.setItem('spark-scope-settings', JSON.stringify({ lang: "${lang}", servers: "one", server: "b" }))`);
+      await mini.go(`${base}/mini/`);
+      await mini.waitFor("document.querySelector('.m-pair .m-metric') !== null");
+      const labels = await mini.evaluate("[...document.querySelectorAll('.m-pair .m-metric small')].map(el=>el.textContent)");
+      report(`mini-omlx-picked-${suffix}`, labels, labels.some(label=>label.includes("1/2")) ? ["picked server is labelled as a partial total"] : []);
+    }
+    await mini.evaluate("localStorage.clear()");
+    await mini.close();
+    const rack = await openPage({ width: 1920, height: 480 });
+    await rack.go(`${base}/rack/?lang=${lang}${width === 375 ? '&width=819' : ''}`);
+    await rack.waitFor("document.querySelectorAll('.bay').length === 2");
+    const result = await rack.evaluate(CHECK_RACK), rackIssues = [...result.issues, ...(lang === "ko" ? await englishLeft(rack, state) : []), ...rack.errors.splice(0)];
+    if (!await rack.evaluate("document.querySelector('#out-coverage').textContent.includes('1/2') && document.querySelector('#out-coverage').getClientRects().length > 0 && getComputedStyle(document.querySelector('#out-coverage')).display !== 'none'")) rackIssues.push("mixed rack coverage missing");
+    await rack.shoot(`rack-omlx-mixed-${suffix}.png`);
+    report(`rack-omlx-mixed-${suffix}`, [result.band], rackIssues);
+    await rack.close();
+  }
+
+  current = { count: 4, mode: "serving", servers: 2, mixedLatency: true, noPrefill: true };
+  const mixed = await openPage({ width: 1440, height: 1000 });
+  await mixed.go(`${base}/`);
+  await mixed.waitFor("/\\d/.test(document.querySelector('#updated-at').textContent)");
+  const gridIssues = await mixed.evaluate(`(() => [...document.querySelectorAll('.engine')].flatMap(grid => {
+    const sections = [...grid.querySelectorAll('.engine-section')], shown = sections.filter(el => !el.hidden);
+    return shown.length !== 2 || !sections[0].hidden || shown.some(el => Math.abs(el.getBoundingClientRect().width - (grid.clientWidth / 2)) > 2) ? ["hidden prefill leaves unused grid width"] : [];
+  }))()`);
+  await mixed.shoot("engine-no-prefill.png", { selector: "#engines" });
+  report("engine-no-prefill.png", ["two visible sections share the grid"], [...gridIssues, ...await mixed.evaluate(CHECK_WEB), ...mixed.errors.splice(0)]);
+  await mixed.close();
+  const mixedMini = await openPage({ width: 340, height: 640 });
+  await mixedMini.go(`${base}/mini/`);
+  await mixedMini.waitFor("document.querySelector('.m-chips') !== null");
+  const mixedChips = await mixedMini.evaluate("document.querySelector('.m-chips').textContent");
+  await mixedMini.shoot("mini-mixed-latency.png");
+  report("mini-mixed-latency.png", [mixedChips], [...await mixedMini.evaluate(CHECK_MINI), ...(/TTFT|TPOT/.test(mixedChips) ? ["mixed latency definitions shown"] : []), ...mixedMini.errors.splice(0)]);
+  await mixedMini.close();
+
+  // The token ledger over the scenario's three months (fixtures.mjs): records starting on the 23rd, a complete month
+  // with five models, and the current month three days in. Every month and view (Statement, Calendar, Charts) in the
+  // default design on a desktop (light) and a phone (dark); the complete month's three views in Korean and in the
+  // other designs. Page and fixture server share its clock.
+  const LEDGER_EXPECT = {
+    "2027-04": { kpis: 4, models: 2, weeks: 2, days: 30 },
+    "2027-05": { kpis: 4, models: 5, weeks: 6, days: 31 },
+    "2027-06": { kpis: 6, models: 1, weeks: 1, days: 30 },
+  };
+  const [, fullMonth] = LEDGER_SCENARIO.months;
+  const SIZES = { desktop: [1440, 1000], phone: [390, 844] };
+  const LEDGER_CASES = [
+    ["default", "light", "desktop", "en", LEDGER_SCENARIO.months], ["default", "dark", "phone", "en", LEDGER_SCENARIO.months],
+    ["default", "light", "desktop", "ko", [fullMonth]], ["default", "dark", "phone", "ko", [fullMonth]],
+    ["console", "dark", "desktop", "en", [fullMonth]], ["soft", "light", "desktop", "en", [fullMonth]], ["soft", "dark", "phone", "en", [fullMonth]],
+  ];
+  for (const [design, scheme, label, lang, months] of LEDGER_CASES) {
+    const [width, height] = SIZES[label];
+    const web = await openPage({ width, height, colorScheme: scheme, shift: ledgerShift });
+    current = { count: 4, mode: "serving", longNames: false, ledger: true };
+    await web.go(`${base}/?design=${design}&lang=${lang}#tokens`);
+    for (const month of months) {
+      const expect = LEDGER_EXPECT[month];
+      // A month button on a desktop, the month list on a phone.
+      await web.evaluate(`(() => { const button = document.querySelector('#token-months [data-month="${month}"]'), list = document.querySelector('#token-months select');
+        if (button) button.click(); else { list.value = "${month}"; list.dispatchEvent(new Event("change", { bubbles: true })); } })()`);
+      await web.waitFor(`document.querySelector('#ledger-panel').dataset.month === "${month}"`);
+      for (const view of ["statement", "calendar", "charts"]) {
+        await web.evaluate(`document.querySelector('[data-ledger-tab="${view}"]').click()`);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        const found = await web.evaluate(CHECK_LEDGER(view, expect));
+        const name = `ledger-${design}-${scheme}-${label}-${month}-${view}${lang === "ko" ? "-ko" : ""}.png`;
+        await web.shoot(name, { fullPage: true });
+        const problems = [...found.issues, ...await web.evaluate(CHECK_WEB), ...(lang === "ko" ? await englishLeft(web, fixtureState(4, "serving")) : []), ...web.errors.splice(0)];
+        report(name, [found.summary], problems);
+        // The calendar's two other figures, then back to output so the next month opens on it.
+        if (view === "calendar") {
+          for (const metric of ["work", "total", "output"]) {
+            await web.evaluate(`document.querySelector('[data-cal-metric="${metric}"]').click()`);
+            await new Promise((resolve) => setTimeout(resolve, 150));
+            if (metric === "output") break;
+            const shown = await web.evaluate(CHECK_LEDGER(view, expect)), pressed = await web.evaluate(`document.querySelector('[data-cal-metric][aria-pressed=true]')?.dataset.calMetric`);
+            const metricName = `ledger-${design}-${scheme}-${label}-${month}-calendar-${metric}${lang === "ko" ? "-ko" : ""}.png`;
+            await web.shoot(metricName, { fullPage: true });
+            const metricProblems = [...shown.issues, ...(pressed === metric ? [] : [`switch shows ${pressed}, expected ${metric}`]), ...await web.evaluate(CHECK_WEB), ...(lang === "ko" ? await englishLeft(web, fixtureState(4, "serving")) : []), ...web.errors.splice(0)];
+            report(metricName, [shown.summary], metricProblems);
+          }
+        }
+      }
+    }
+    // Once: the CSV button saves the month on screen (June), one row per day and model under the header.
+    if (design === "default" && scheme === "light" && label === "desktop" && lang === "en") {
+      const file = path.join(OUT, `spark-scope-tokens-${LEDGER_SCENARIO.months.at(-1)}.csv`);
+      rmSync(file, { force: true });
+      await send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: OUT });
+      await web.evaluate("document.querySelector('#token-csv').click()");
+      for (let i = 0; i < 50 && !existsSync(file); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+      const lines = existsSync(file) ? readFileSync(file, "utf8").trimEnd().split("\r\n") : [];
+      const expected = usageMonth(LEDGER_SCENARIO.months.at(-1), LEDGER_SCENARIO.now, { start: LEDGER_SCENARIO.start }).days.reduce((count, day) => count + day.models.length, 0);
+      const problems = [...web.errors.splice(0)];
+      if (lines[0] !== "day,model,cache_read,new_input,logical_input,output,requests" || lines.length !== expected + 1) problems.push(`CSV: ${lines.length} lines, expected ${expected + 1}: ${lines[0] ?? "no file"}`);
+      report(path.basename(file), [lines[1] ?? ""], problems);
+      await send("Browser.setDownloadBehavior", { behavior: "default" });
+    }
+    await web.evaluate("localStorage.clear()");
+    await web.close();
+  }
 } finally {
   socket.close();
   chrome.kill();
@@ -325,5 +1384,6 @@ try {
   await new Promise((resolve) => setTimeout(resolve, 300));
   cleanUp();
 }
+if (untranslated.size) console.log(`\nnote: English on the Korean pages (fails with STRICT_I18N=1): ${[...untranslated].join(" ")}`);
 console.log(`\nPNGs in ${OUT}`);
 process.exit(failures ? 1 : 0);
