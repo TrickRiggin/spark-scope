@@ -781,7 +781,7 @@ test("engine Bearer credentials are environment-only, private, bounded to GET po
     assert.equal(requested.includes("/admin/api/stats"), false, "authenticated requests never follow a redirect");
     for (const invalidKey of [`${apiKey}\n`, `${apiKey} secret`]) assert.throws(() => new InferenceCollector(url, { apiKeyEnv: "ENGINE_TOKEN", env: { ENGINE_TOKEN: invalidKey } }), error => !error.message.includes(apiKey));
   }, { apiKey });
-  await withFakeEngine("", async (url, _setMetrics, setHealth, _setModels, _setSlots, requested, setResponse) => {
+  await withFakeEngine("", async (url, _setMetrics, setHealth, setModels, _setSlots, requested, setResponse) => {
     const collector = new InferenceCollector(url);
     setHealth(fixture.health);
     setResponse("/metrics", 404, "not found");
@@ -793,6 +793,7 @@ test("engine Bearer credentials are environment-only, private, bounded to GET po
     assert.equal((await collector.collect()).ok, false);
     assert.equal(requested.includes("/admin/api/stats"), false, "unkeyed oMLX status also refuses admin redirects");
     setHealth({ default_model: "other", engine_pool: [] });
+    setModels([]);
     const start = requested.length;
     assert.equal((await collector.collect()).error, "metrics HTTP 404");
     assert.equal(requested.slice(start).includes("/api/status"), false);
@@ -1418,4 +1419,69 @@ test("recent latency comes from histogram differences over the last 5 minutes an
   // So does a histogram that appears or disappears.
   recent.add(31 * MIN, { ttft: buckets([2, 3, 9, 9]), tpot: buckets([1, 1, 1, 1]) });
   assert.equal(recent.windowSeconds, 0);
+});
+
+test("ds4-server metrics map onto the counters, with no /health route and no process start time", async () => {
+  const text = readFileSync(new URL("./fixtures/ds4-v0.5.4.txt", import.meta.url), "utf8");
+  assert.equal(metricsEngine(parsePrometheus(text)), "ds4");
+  assert.equal(knownEngine("/opt/ds4/ds4-server"), "ds4");
+  const { InferenceCollector } = await import("../lib/collectors.mjs");
+  await withFakeEngine(text, async (url, setMetrics, _setHealth, setModels, _setSlots, _requested, setResponse) => {
+    setResponse("/health", 404, { error: { message: "unknown endpoint" } });
+    setModels([{ id: "deepseek-v4-flash" }]);
+    const collector = new InferenceCollector(url);
+    const first = await collector.collect();
+    assert.equal(first.ok, true);
+    assert.equal(first.engine, "ds4");
+    assert.equal(first.modelName, "deepseek-v4-flash");
+    assert.equal(first.generationTokensTotal, 2400);
+    assert.equal(first.promptTokensTotal, 144);
+    assert.equal(first.promptComputeTokensTotal, 144);
+    assert.equal(first.promptCacheTokensTotal, 0);
+    assert.equal(first.runningRequests, 0);
+    assert.equal(first.waitingRequests, null);
+    assert.equal(first.completedRequestsTotal, 4);
+    assert.equal(first.prefixCacheHitPercent, 0);
+    assert.equal(first.metricKinds.prefixCacheHitPercent, "sinceStart");
+    assert.ok(Math.abs(first.speculativeAcceptancePercent - 1438 / 2208 * 100) < 1e-9);
+    assert.equal(first.processStartedAt, null);
+    assert.equal(first.outputTokensPerSecond, null, "unknown until two polls of the same run");
+    for (const key of ["promptTokensPerSecond", "promptComputeTokensPerSecond", "promptCacheTokensPerSecond", "kvCachePercent", "ttftP95RecentSeconds", "tpotP95RecentSeconds"]) assert.equal(first.reported[key], false, key);
+    for (const key of ["prefixCacheHitPercent", "speculativeAcceptancePercent", "completedRequestsTotal"]) assert.equal(first.reported[key], true, key);
+    setMetrics(text.replace("ds4_tokens_decoded_total 2400", "ds4_tokens_decoded_total 2500")
+      .replace('kind="cached"} 0', 'kind="cached"} 56').replace("ds4_requests_inflight 0", "ds4_requests_inflight 1"));
+    collector.previous.at -= 1000;
+    const second = await collector.collect();
+    assert.ok(Math.abs(second.outputTokensPerSecond - 100) < 5);
+    assert.equal(second.runningRequests, 1);
+    assert.equal(second.prefixCacheHitPercent, 56 / 200 * 100);
+  });
+  // A real failure still reads as down: /health answering 503 is not overridden by the metrics.
+  await withFakeEngine(text, async (url, _setMetrics, _setHealth, _setModels, _setSlots, _requested, setResponse) => {
+    setResponse("/health", 503, "unavailable");
+    assert.equal((await new InferenceCollector(url).collect()).ok, false);
+  });
+});
+
+test("a server with /health and /v1/models but no /metrics (TabbyAPI) is up with its model name and no figures", async () => {
+  const { InferenceCollector } = await import("../lib/collectors.mjs");
+  await withFakeEngine("", async (url, _setMetrics, setHealth, setModels, _setSlots, _requested, setResponse) => {
+    setResponse("/metrics", 404, { detail: "Not Found" });
+    setHealth({ status: "healthy", issues: [] });
+    setModels([{ id: "ornith-1.5-122b-exl3-4bpw", object: "model" }]);
+    const reading = await new InferenceCollector(url).collect();
+    assert.equal(reading.ok, true);
+    assert.equal(reading.engine, null);
+    assert.equal(reading.modelName, "ornith-1.5-122b-exl3-4bpw");
+    assert.ok(Object.values(reading.reported).every((value) => value === false));
+    setModels([]);
+    const empty = await new InferenceCollector(url).collect();
+    assert.equal(empty.ok, false);
+    assert.equal(empty.error, "metrics HTTP 404");
+  });
+  await withFakeEngine("", async (url, _setMetrics, _setHealth, _setModels, _setSlots, _requested, setResponse) => {
+    setResponse("/metrics", 404, { detail: "Not Found" });
+    setResponse("/health", 503, { status: "unhealthy" });
+    assert.equal((await new InferenceCollector(url).collect()).ok, false);
+  });
 });

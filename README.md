@@ -52,6 +52,8 @@ servers, TensorFold and the single token ledger now come from upstream) and keep
 - **Chart axes and hover.** The output, temperature and memory charts carry Y-axis labels, and hovering shows the time
   and every series' value at the nearest sample.
 - **systemd `starting` is not a fault.** DGX OS's boot-splash wait can stay queued for days on a headless box.
+- **ds4 and metric-less servers.** Entrpi's `ds4-server` is read from its `ds4_` metrics; a server with `/health` and
+  `/v1/models` but no `/metrics` (TabbyAPI) shows as up with its model name and no figures.
 
 ## Installation
 
@@ -206,6 +208,8 @@ Point `SPARK_SCOPE_API_URL` at the inference server. In multi-node serving, poin
 | llama.cpp | Start `llama-server` with `--metrics`. Keep `/slots` on (the default) for live output speed. | No TTFT or completed-request count. Mean decode time replaces TPOT p95, and context use replaces KV cache. |
 | Strata | Metrics are always on. | Context use replaces KV cache. |
 | oMLX | No flag needed; it reads the status API. | No live output speed, TTFT, TPOT, KV cache, cache-read speed or speculative acceptance. Prefill and decode are averages over completed requests. |
+| ds4 (`ds4-server`) | Metrics are always on; there is no `/health` route, so an answering `/metrics` counts as up. | No prefill speed, cache-read speed, waiting requests, TTFT, TPOT or KV cache. Cache hit is since start. |
+| No metrics (TabbyAPI) | Nothing to set. A server that answers `/health` and `/v1/models` but has no `/metrics` shows as up with its model name. | Every figure. |
 
 The engine panel and the mini window show only the fields an engine reports. How each figure is measured: [Inference engines](docs/configuration.md#inference-engines).
 

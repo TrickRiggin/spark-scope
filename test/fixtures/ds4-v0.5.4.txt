@@ -1,0 +1,57 @@
+# TYPE ds4_uptime_seconds gauge
+ds4_uptime_seconds 1238
+# TYPE ds4_requests_started_total counter
+ds4_requests_started_total 4
+# TYPE ds4_requests_total counter
+ds4_requests_total{outcome="completed"} 4
+ds4_requests_total{outcome="failed"} 0
+ds4_requests_total{outcome="refused_deep_serial"} 0
+# TYPE ds4_requests_inflight gauge
+ds4_requests_inflight 0
+# TYPE ds4_requests_serial_total counter
+ds4_requests_serial_total 0
+# TYPE ds4_cont_admit_rejects_total counter
+ds4_cont_admit_rejects_total 0
+# TYPE ds4_cont_batch_failures_total counter
+ds4_cont_batch_failures_total 0
+# TYPE ds4_graph_fit_refusals_total counter
+ds4_graph_fit_refusals_total 0
+# TYPE ds4_admits_total counter
+ds4_admits_total{kind="cold"} 4
+ds4_admits_total{kind="warm"} 0
+ds4_admits_total{kind="fork"} 0
+ds4_admits_total{kind="partial_fork"} 0
+ds4_admits_total{kind="partial_truncate"} 0
+# TYPE ds4_tokens_prefilled_total counter
+ds4_tokens_prefilled_total{kind="computed"} 144
+ds4_tokens_prefilled_total{kind="cached"} 0
+# TYPE ds4_tokens_decoded_total counter
+ds4_tokens_decoded_total 2400
+# TYPE ds4_decode_steps_total counter
+ds4_decode_steps_total 958
+# TYPE ds4_spec_drafts_total counter
+ds4_spec_drafts_total 2208
+# TYPE ds4_spec_hits_total counter
+ds4_spec_hits_total 1438
+# TYPE ds4_spec_quench_total counter
+ds4_spec_quench_total 0
+# TYPE ds4_spec_accept_ratio gauge
+ds4_spec_accept_ratio 0.6513
+# TYPE ds4_decode_tok_s gauge
+ds4_decode_tok_s 0.00
+# TYPE ds4_prefill_tok_s gauge
+ds4_prefill_tok_s 0.00
+# TYPE ds4_tok_per_step gauge
+ds4_tok_per_step 0.000
+# TYPE ds4_banks_live gauge
+ds4_banks_live 0
+# TYPE ds4_banks_total gauge
+ds4_banks_total 32
+# TYPE ds4_warm_records gauge
+ds4_warm_records 4
+# TYPE ds4_kv_pages_resident gauge
+ds4_kv_pages_resident 146
+# TYPE ds4_derived_artifacts gauge
+ds4_derived_artifacts{source="built"} 474
+# TYPE ds4_derived_artifact_bytes gauge
+ds4_derived_artifact_bytes 84512276480

@@ -80,6 +80,12 @@ Apple Silicon Macs use the same topology as Linux nodes. `"host": "local"` colle
   - if the endpoint returns JSON despite the Accept header, the existing JSON parser remains available. It hides latency fields without histograms and uses context information from JSON, averaging processing slots when present;
   - speculative acceptance is accepted over offered draft tokens;
   - a server started with an API key needs the dashboard's environment-based Bearer key to read `/metrics`.
+- **ds4** (`ds4-server`, Entrpi ds4 0.5.4): read from its `ds4_` metrics. It has no `/health` route, so a 404 there with metrics from a known engine counts as up. Differences:
+  - output speed is the increase in `ds4_tokens_decoded_total` between polls. The `ds4_decode_tok_s` and `ds4_prefill_tok_s` gauges average a 60-second window that includes idle seconds, so they are not used;
+  - input totals add `ds4_tokens_prefilled_total{kind="computed"}` and `{kind="cached"}`; **Cache hit since start** is cached over both. No prefill time is exported, so prefill and cache-read speeds are hidden;
+  - running requests are `ds4_requests_inflight`; completed requests are `ds4_requests_total{outcome="completed"}`; speculative acceptance is `ds4_spec_hits_total` over `ds4_spec_drafts_total`;
+  - no waiting requests, TTFT, TPOT or KV cache. The process start time is left unknown (uptime is whole seconds), so the ledger sees a restart by counters going down.
+- **No metrics endpoint** (TabbyAPI): when `/metrics` is 404, `/health` answers and the body is not oMLX's, the server reads as up with the model named by `/v1/models` and no figures. If `/v1/models` lists nothing, it stays "metrics HTTP 404".
 - **oMLX**: read-only health and status polling on Apple Silicon Macs, tested with 0.7.0. See [oMLX](#omlx) below.
 - Other engines (Ollama, TensorRT-LLM, Triton) are recognised by process or image name on the node cards, but their throughput and token metrics are not read.
 
